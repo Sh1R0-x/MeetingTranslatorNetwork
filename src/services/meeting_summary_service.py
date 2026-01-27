@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import requests
 from docx import Document
@@ -16,8 +16,12 @@ except Exception:
     argos_translate = None
 
 
+# Support 2 formats :
+# 1) [HH:MM:SS - HH:MM:SS] SPEAKER: TEXT
+# 2) HH:MM:SS - HH:MM:SS SPEAKER TEXT
 _TRANSCRIPT_RE = re.compile(
-    r"^\[(\d{2}:\d{2}:\d{2}) - (\d{2}:\d{2}:\d{2})\]\s+([A-Za-z0-9_]+):\s+(.*)$"
+    r"^(?:\[(\d{2}:\d{2}:\d{2})\s*-\s*(\d{2}:\d{2}:\d{2})\]\s+([A-Za-z0-9_]+)\s*:\s*(.*)"
+    r"|(\d{2}:\d{2}:\d{2})\s*-\s*(\d{2}:\d{2}:\d{2})\s+([A-Za-z0-9_]+)\s+(.*))$"
 )
 
 
@@ -32,7 +36,7 @@ class TranscriptLine:
 class MeetingSummaryService:
     """
     Génère un DOCX final.
-    - Ajoute une table de transcription (EN) + traduction FR.
+    - Ajoute une table de transcription + traduction FR (si Argos est dispo).
     - Ajoute un résumé via Perplexity si API key fournie (sinon section simple).
     """
 
@@ -54,15 +58,29 @@ class MeetingSummaryService:
     def _parse_transcript(self, transcript_path: Path) -> List[TranscriptLine]:
         lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
         out: List[TranscriptLine] = []
+
         for ln in lines:
-            m = _TRANSCRIPT_RE.match(ln.strip())
+            ln = ln.strip()
+            if not ln:
+                continue
+
+            m = _TRANSCRIPT_RE.match(ln)
             if not m:
                 continue
-            start, end, spk, text = m.groups()
+
+            # Groupes pour format 1
+            if m.group(1) is not None:
+                start, end, spk, text = m.group(1), m.group(2), m.group(3), m.group(4)
+            else:
+                # Groupes pour format 2
+                start, end, spk, text = m.group(5), m.group(6), m.group(7), m.group(8)
+
             text = (text or "").strip()
             if not text:
                 continue
+
             out.append(TranscriptLine(start=start, end=end, speaker=spk, text=text))
+
         return out
 
     def _translate_en_to_fr(self, text: str) -> str:
@@ -89,7 +107,6 @@ class MeetingSummaryService:
             "Content-Type": "application/json",
         }
 
-        # Prompt court + robuste
         payload = {
             "model": "sonar",
             "messages": [
@@ -148,7 +165,7 @@ class MeetingSummaryService:
         doc.add_paragraph("")
 
         # Transcript bilingual
-        doc.add_heading("Transcription (EN) + Traduction (FR)", level=1)
+        doc.add_heading("Transcription + Traduction (FR)", level=1)
 
         segs = self._parse_transcript(transcript_path)
         if not segs:
@@ -158,7 +175,7 @@ class MeetingSummaryService:
             hdr = table.rows[0].cells
             hdr[0].text = "Temps"
             hdr[1].text = "Speaker"
-            hdr[2].text = "Texte (EN)"
+            hdr[2].text = "Texte"
             hdr[3].text = "Traduction (FR)"
 
             # Header bold
@@ -171,6 +188,7 @@ class MeetingSummaryService:
                 row[0].text = f"{s.start} - {s.end}"
                 row[1].text = s.speaker
                 row[2].text = s.text
+
                 fr = self._translate_en_to_fr(s.text)
                 row[3].text = fr if fr else "(Traduction indisponible)"
 
@@ -184,10 +202,39 @@ class MeetingSummaryService:
         if summary:
             doc.add_paragraph(summary)
         else:
-            doc.add_paragraph(
-                "Résumé non disponible (clé Perplexity absente ou erreur d'appel)."
-            )
+            doc.add_paragraph("Résumé non disponible (clé Perplexity absente ou erreur d'appel).")
 
-        out_path = session_dir / "meeting_summary.docx"
+        out_path = session_dir / "Résumé de Réunion.docx"
         doc.save(str(out_path))
         return out_path
+
+
+# ---------------------------------------------------------------------
+# ✅ Wrapper attendu par main.py (pour compatibilité)
+# ---------------------------------------------------------------------
+def generate_meeting_docx(transcript_path: Path, session_dir: Path, cfg: dict) -> Path:
+    """
+    Compat main.py :
+    generate_meeting_docx(transcript_path=..., session_dir=..., cfg=...)
+    """
+    transcript_path = Path(transcript_path)
+    session_dir = Path(session_dir)
+
+    # Récupère la clé Perplexity depuis secure_store si possible
+    perplexity_key = ""
+    try:
+        from config.secure_store import getsecret
+        perplexity_key = getsecret(cfg, "perplexity_api_key") or ""
+    except Exception:
+        perplexity_key = cfg.get("perplexity_api_key", "") or ""
+
+    title = cfg.get("docx_title", "Résumé de Réunion") or "Résumé de Réunion"
+    participants = cfg.get("docx_participants", "N/A") or "N/A"
+
+    service = MeetingSummaryService(perplexity_api_key=perplexity_key)
+    return service.generate_meeting_docx(
+        session_dir=session_dir,
+        transcript_path=transcript_path,
+        title=title,
+        participants=participants,
+    )

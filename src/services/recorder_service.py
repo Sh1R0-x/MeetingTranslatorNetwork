@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import re
-import wave
 import queue
+import re
 import threading
+import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import List, Optional
 
 import numpy as np
-import sounddevice as sd
 import pyaudiowpatch as pyaudio
+import sounddevice as sd
 
 from audio.wasapi_loopback import get_loopback_for_output
 
@@ -19,7 +19,7 @@ PART_SECONDS = 2 * 60 * 60  # 2 heures
 
 
 def _safe_name(s: str) -> str:
-    s = s.strip()
+    s = (s or "").strip()
     s = re.sub(r'[<>:"/\\|?*\n\r\t]', "_", s)
     s = re.sub(r"\s+", " ", s)
     return s
@@ -41,15 +41,18 @@ class TrackSpec:
 
 class _WavRotatingWriter:
     def __init__(self, base_dir: Path, time_prefix: str, label: str, samplerate: int, channels: int):
-        self.base_dir = base_dir
-        self.time_prefix = time_prefix
+        self.base_dir = Path(base_dir)
+        self.time_prefix = str(time_prefix)
         self.label = _safe_name(label)
         self.samplerate = int(samplerate)
         self.channels = int(channels)
+
         self.part_index = 1
         self.frames_written = 0
+
         self.wav: Optional[wave.Wave_write] = None
         self.paths: List[Path] = []
+
         self._open_new_part()
 
     def _open_new_part(self):
@@ -65,26 +68,40 @@ class _WavRotatingWriter:
         wf.setnchannels(self.channels)
         wf.setsampwidth(2)  # 16-bit PCM
         wf.setframerate(self.samplerate)
-        self.wav = wf
 
+        self.wav = wf
         self.frames_written = 0
         self.part_index += 1
 
     def write_frames_i16_bytes(self, data_bytes: bytes, frames: int):
         if self.wav is None:
             return
+
+        frames = int(frames)
+        if frames <= 0:
+            return
+
         if self.frames_written + frames >= PART_SECONDS * self.samplerate:
             self._open_new_part()
+
         self.wav.writeframes(data_bytes)
         self.frames_written += frames
 
     def close(self):
         if self.wav is not None:
             self.wav.close()
-            self.wav = None
+        self.wav = None
 
 
 class RecorderService:
+    """
+    Enregistre 2 pistes:
+    - Participants: loopback de la sortie Windows (WASAPI) en PCM16 via PyAudioWPatch
+    - Micro: entrée micro via sounddevice (float32) convertie en PCM16
+
+    En plus, tu peux brancher une queue live (participants) pour envoyer l'audio vers une transcription live.
+    """
+
     def __init__(
         self,
         participants_output_device_id: int,
@@ -96,17 +113,18 @@ class RecorderService:
         self.participants_output_device_id = int(participants_output_device_id)
         self.mic_device_id = int(mic_device_id)
 
-        # ✅ Nouveau dossier par défaut
-        self.output_root = output_root or (Path.home() / "Documents" / "MeetingTranslatorNetwork")
+        # Dossier par défaut (celui qu'on voulait dans la discussion)
+        self.output_root = Path(output_root) if output_root else (Path.home() / "Documents" / "MeetingTranslatorNetwork")
 
         self.participants_label = participants_label
         self.my_audio_label = my_audio_label
 
         self._running = False
+
         self._q_part = queue.Queue()
         self._q_mic = queue.Queue()
 
-        # LIVE (participants)
+        # LIVE (participants): on met (bytes_pcm16, frames) ou None
         self._q_live_part = None
 
         self.participants_rate: Optional[int] = None
@@ -120,7 +138,6 @@ class RecorderService:
 
         self._pa: Optional[pyaudio.PyAudio] = None
         self._pa_stream = None
-
         self._sd_stream: Optional[sd.InputStream] = None
 
         self.session_dir: Optional[Path] = None
@@ -128,7 +145,7 @@ class RecorderService:
         self.participants_track = TrackSpec(label=self.participants_label, wav_paths=[])
         self.my_track = TrackSpec(label=self.my_audio_label, wav_paths=[])
 
-    # IMPORTANT: signature simple (évite les soucis de crochets/quotes)
+    # IMPORTANT: signature simple (évite les soucis d'import/circular)
     def set_live_participants_queue(self, q):
         self._q_live_part = q
 
@@ -144,12 +161,13 @@ class RecorderService:
         self.session_dir = self.output_root / date_dir / time_prefix
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
+        # -------- Participants (loopback) --------
         lb = get_loopback_for_output(self.participants_output_device_id)
         if not lb:
             raise RuntimeError("Loopback introuvable pour la sortie sélectionnée (participants).")
 
         part_rate = int(lb["defaultSampleRate"])
-        part_channels = int(lb.get("maxInputChannels", 2)) or 2
+        part_channels = int(lb.get("maxInputChannels", 2) or 2)
 
         self.participants_rate = part_rate
         self.participants_channels = part_channels
@@ -170,10 +188,12 @@ class RecorderService:
         def cb_part(in_data, frame_count, time_info, status):
             try:
                 if in_data:
-                    self._q_part.put((in_data, int(frame_count)))
+                    frames_i = int(frame_count)
+                    self._q_part.put((in_data, frames_i))
+
                     if self._q_live_part is not None:
                         try:
-                            self._q_live_part.put_nowait((in_data, int(frame_count)))
+                            self._q_live_part.put_nowait((in_data, frames_i))
                         except queue.Full:
                             pass
             except Exception:
@@ -191,6 +211,7 @@ class RecorderService:
         )
         self._pa_stream.start_stream()
 
+        # -------- Micro (sounddevice) --------
         mic_dev = sd.query_devices(self.mic_device_id, "input")
         mic_rate = int(mic_dev["default_samplerate"])
         mic_channels = 1
@@ -208,7 +229,7 @@ class RecorderService:
 
         def cb_mic(indata, frames, time_info, status):
             try:
-                mono = indata[:, 0] if indata.ndim > 1 else indata
+                mono = indata[:, 0] if getattr(indata, "ndim", 1) > 1 else indata
                 i16 = (np.clip(mono, -1.0, 1.0) * 32767).astype(np.int16)
                 self._q_mic.put((i16.tobytes(), int(frames)))
             except Exception:
@@ -233,29 +254,32 @@ class RecorderService:
 
         self._running = False
 
+        # Stop sounddevice mic
         if self._sd_stream is not None:
             try:
                 self._sd_stream.stop()
                 self._sd_stream.close()
             except Exception:
                 pass
-            self._sd_stream = None
+        self._sd_stream = None
 
+        # Stop pyaudio loopback
         if self._pa_stream is not None:
             try:
                 self._pa_stream.stop_stream()
                 self._pa_stream.close()
             except Exception:
                 pass
-            self._pa_stream = None
+        self._pa_stream = None
 
         if self._pa is not None:
             try:
                 self._pa.terminate()
             except Exception:
                 pass
-            self._pa = None
+        self._pa = None
 
+        # Stop writer threads
         self._q_part.put(None)
         self._q_mic.put(None)
 
@@ -270,6 +294,7 @@ class RecorderService:
         if self._t_mic is not None:
             self._t_mic.join(timeout=5)
 
+        # Close writers and expose file paths
         if self._writer_part is not None:
             self._writer_part.close()
             self.participants_track.wav_paths = list(self._writer_part.paths)

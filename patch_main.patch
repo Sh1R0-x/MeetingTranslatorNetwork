@@ -1,0 +1,62 @@
+﻿diff --git a/src/main.py b/src/main.py
+--- a/src/main.py
++++ b/src/main.py
+@@ -107,7 +107,7 @@
+         try:
+             hf_token = getsecret(self.cfg, "hf_token") or ""
+             if not hf_token:
+-                raise RuntimeError("HuggingFace token manquant (Setup -> HuggingFace Token).")
++                log_line("[PostProcess] ⚠ HuggingFace token absent : diarization pyannote sera désactivée (fallback 1 speaker).")
+ 
+             transcript_path = diarize_session(
+                 wav_path=self.recorder.wav_path,
+@@ -220,15 +220,49 @@
+                 data_bytes, frames = item
+                 frames = int(frames) if frames else 0
+ 
+                 if not data_bytes or frames <= 0:
+                     continue
+ 
+-                await self._transcriber.append_audio_pcm16(data_bytes)
+-                frames_since_commit += frames
+-
+-                if self.input_samplerate > 0:
+-                    seconds = frames_since_commit / float(self.input_samplerate)
++                # --- Conversion Realtime ---
++                # OpenAI Realtime est bien plus stable avec du PCM16 MONO 24kHz.
++                # Ici on convertit (si nécessaire) le flux loopback (souvent 48kHz stéréo).
++                import audioop
++
++                target_sr = 24000
++                target_ch = 1
++
++                # Downmix stéréo -> mono (si besoin)
++                if self.input_channels and self.input_channels != target_ch:
++                    try:
++                        data_bytes = audioop.tomono(data_bytes, 2, 0.5, 0.5)
++                    except Exception:
++                        pass
++
++                # Resample -> 24kHz (si besoin) en conservant l'état entre chunks
++                if not hasattr(self, "_ratecv_state"):
++                    self._ratecv_state = None
++
++                if self.input_samplerate and self.input_samplerate != target_sr:
++                    try:
++                        data_bytes, self._ratecv_state = audioop.ratecv(
++                            data_bytes, 2, 1, self.input_samplerate, target_sr, self._ratecv_state
++                        )
++                    except Exception:
++                        # Si échec, on envoie tel quel (moins fiable, mais évite de bloquer)
++                        pass
++
++                frames_out = len(data_bytes) // 2  # 2 bytes par sample PCM16 mono
++
++                await self._transcriber.append_audio_pcm16(data_bytes)
++                frames_since_commit += frames_out
++
++                if target_sr > 0:
++                    seconds = frames_since_commit / float(target_sr)
+                     if seconds >= self.commit_every_seconds:
+                         await self._transcriber.commit_audio()
+                         frames_since_commit = 0

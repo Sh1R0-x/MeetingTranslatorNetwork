@@ -1,0 +1,426 @@
+warning: in the working copy of 'src/main.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/services/diarization_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/services/meeting_summary_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/services/recorder_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/ui/setup_window.py', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/sandbox/audio_tests/list_devices.py b/sandbox/audio_tests/list_devices.py[m
+[1mdeleted file mode 100644[m
+[1mindex dc54012..0000000[m
+[1m--- a/sandbox/audio_tests/list_devices.py[m
+[1m+++ /dev/null[m
+[36m@@ -1,18 +0,0 @@[m
+[31m-import sounddevice as sd[m
+[31m-[m
+[31m-def main():[m
+[31m-    print("Host APIs:")[m
+[31m-    for i, api in enumerate(sd.query_hostapis()):[m
+[31m-        print(f"  [{i}] {api['name']}")[m
+[31m-[m
+[31m-    print("\nDevices:")[m
+[31m-    for i, dev in enumerate(sd.query_devices()):[m
+[31m-        io = [][m
+[31m-        if dev["max_input_channels"] > 0:[m
+[31m-            io.append(f"in={dev['max_input_channels']}")[m
+[31m-        if dev["max_output_channels"] > 0:[m
+[31m-            io.append(f"out={dev['max_output_channels']}")[m
+[31m-        print(f"  [{i}] {dev['name']} ({', '.join(io)})")[m
+[31m-[m
+[31m-if __name__ == "__main__":[m
+[31m-    main()[m
+[1mdiff --git a/sandbox/audio_tests/list_wasapi_outputs.py b/sandbox/audio_tests/list_wasapi_outputs.py[m
+[1mdeleted file mode 100644[m
+[1mindex 9a36650..0000000[m
+[1m--- a/sandbox/audio_tests/list_wasapi_outputs.py[m
+[1m+++ /dev/null[m
+[36m@@ -1,10 +0,0 @@[m
+[31m-from pathlib import Path[m
+[31m-import sys[m
+[31m-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))[m
+[31m-[m
+[31m-from audio.wasapi_loopback import list_wasapi_output_devices, get_loopback_for_output[m
+[31m-[m
+[31m-outs = list_wasapi_output_devices()[m
+[31m-for d in outs:[m
+[31m-    lb = get_loopback_for_output(d["index"])[m
+[31m-    print(d["index"], d["name"], "=>", (lb["name"] if lb else "NO LOOPBACK"))[m
+[1mdiff --git a/sandbox/audio_tests/record_mic.py b/sandbox/audio_tests/record_mic.py[m
+[1mdeleted file mode 100644[m
+[1mindex b95e6e8..0000000[m
+[1m--- a/sandbox/audio_tests/record_mic.py[m
+[1m+++ /dev/null[m
+[36m@@ -1,25 +0,0 @@[m
+[31m-import numpy as np[m
+[31m-import sounddevice as sd[m
+[31m-from scipy.io import wavfile[m
+[31m-[m
+[31m-DEVICE_ID = 6           # Microphone (Logitech G733 Gaming Headset) (in=2)[m
+[31m-SAMPLE_RATE = 48000[m
+[31m-CHANNELS = 1            # on force 1 channel, même si le device annonce 2[m
+[31m-DURATION_SEC = 10[m
+[31m-[m
+[31m-def main():[m
+[31m-    print("Recording Mic...")[m
+[31m-    sd.default.device = (DEVICE_ID, None)[m
+[31m-    sd.default.samplerate = SAMPLE_RATE[m
+[31m-    sd.default.channels = CHANNELS[m
+[31m-[m
+[31m-    audio = sd.rec(int(DURATION_SEC * SAMPLE_RATE), dtype="float32")[m
+[31m-    sd.wait()[m
+[31m-[m
+[31m-    audio_i16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)[m
+[31m-    out = "mic_test.wav"[m
+[31m-    wavfile.write(out, SAMPLE_RATE, audio_i16)[m
+[31m-    print(f"Saved: {out}")[m
+[31m-[m
+[31m-if __name__ == "__main__":[m
+[31m-    main()[m
+[1mdiff --git a/sandbox/audio_tests/record_participants_loopback.py b/sandbox/audio_tests/record_participants_loopback.py[m
+[1mdeleted file mode 100644[m
+[1mindex a77f486..0000000[m
+[1m--- a/sandbox/audio_tests/record_participants_loopback.py[m
+[1m+++ /dev/null[m
+[36m@@ -1,49 +0,0 @@[m
+[31m-import time[m
+[31m-import wave[m
+[31m-import pyaudiowpatch as pyaudio[m
+[31m-[m
+[31m-DURATION = 5[m
+[31m-CHUNK = 512[m
+[31m-OUT = "participants_loopback.wav"[m
+[31m-[m
+[31m-def main():[m
+[31m-    with pyaudio.PyAudio() as p:[m
+[31m-        wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)[m
+[31m-        default_out = p.get_device_info_by_index(wasapi["defaultOutputDevice"])[m
+[31m-[m
+[31m-        # Trouver le device loopback qui correspond à la sortie par défaut[m
+[31m-        loop = default_out[m
+[31m-        if not loop.get("isLoopbackDevice", False):[m
+[31m-            for d in p.get_loopback_device_info_generator():[m
+[31m-                if default_out["name"] in d["name"]:[m
+[31m-                    loop = d[m
+[31m-                    break[m
+[31m-            else:[m
+[31m-                raise RuntimeError("Loopback device introuvable. Essaie: python -m pyaudiowpatch")[m
+[31m-[m
+[31m-        channels = int(loop["maxInputChannels"]) or 2[m
+[31m-        rate = int(loop["defaultSampleRate"])[m
+[31m-[m
+[31m-        wf = wave.open(OUT, "wb")[m
+[31m-        wf.setnchannels(channels)[m
+[31m-        wf.setsampwidth(pyaudio.get_sample_size(pyaudio.paInt16))[m
+[31m-        wf.setframerate(rate)[m
+[31m-[m
+[31m-        def cb(in_data, frame_count, time_info, status):[m
+[31m-            wf.writeframes(in_data)[m
+[31m-            return (in_data, pyaudio.paContinue)[m
+[31m-[m
+[31m-        with p.open(format=pyaudio.paInt16,[m
+[31m-                    channels=channels,[m
+[31m-                    rate=rate,[m
+[31m-                    input=True,[m
+[31m-                    input_device_index=loop["index"],[m
+[31m-                    frames_per_buffer=CHUNK,[m
+[31m-                    stream_callback=cb):[m
+[31m-            time.sleep(DURATION)[m
+[31m-[m
+[31m-        wf.close()[m
+[31m-        print(f"Saved: {OUT} from {loop['name']}")[m
+[31m-[m
+[31m-if __name__ == "__main__":[m
+[31m-    main()[m
+[1mdiff --git a/sandbox/audio_tests/record_stereo_mix.py b/sandbox/audio_tests/record_stereo_mix.py[m
+[1mdeleted file mode 100644[m
+[1mindex 822c801..0000000[m
+[1m--- a/sandbox/audio_tests/record_stereo_mix.py[m
+[1m+++ /dev/null[m
+[36m@@ -1,29 +0,0 @@[m
+[31m-import time[m
+[31m-import numpy as np[m
+[31m-import sounddevice as sd[m
+[31m-from scipy.io import wavfile[m
+[31m-[m
+[31m-DEVICE_ID = 16          # Mixage stéréo (Realtek HD Audio Stereo input)[m
+[31m-SAMPLE_RATE = 48000     # on force un truc standard[m
+[31m-CHANNELS = 2[m
+[31m-DURATION_SEC = 10[m
+[31m-[m
+[31m-def main():[m
+[31m-    print("Recording Stereo Mix...")[m
+[31m-    sd.default.device = (DEVICE_ID, None)  # input device only[m
+[31m-    sd.default.samplerate = SAMPLE_RATE[m
+[31m-    sd.default.channels = CHANNELS[m
+[31m-[m
+[31m-    audio = sd.rec(int(DURATION_SEC * SAMPLE_RATE), dtype="float32")[m
+[31m-    sd.wait()[m
+[31m-[m
+[31m-    # Convert float32 [-1, 1] -> int16[m
+[31m-    audio_i16 = np.clip(audio, -1.0, 1.0)[m
+[31m-    audio_i16 = (audio_i16 * 32767).astype(np.int16)[m
+[31m-[m
+[31m-    out = "stereo_mix_test.wav"[m
+[31m-    wavfile.write(out, SAMPLE_RATE, audio_i16)[m
+[31m-    print(f"Saved: {out}")[m
+[31m-[m
+[31m-if __name__ == "__main__":[m
+[31m-    main()[m
+[1mdiff --git a/sandbox/audio_tests/record_stereo_mix_stream.py b/sandbox/audio_tests/record_stereo_mix_stream.py[m
+[1mdeleted file mode 100644[m
+[1mindex 3a07b81..0000000[m
+[1m--- a/sandbox/audio_tests/record_stereo_mix_stream.py[m
+[1m+++ /dev/null[m
+[36m@@ -1,53 +0,0 @@[m
+[31m-import queue[m
+[31m-import time[m
+[31m-import numpy as np[m
+[31m-import sounddevice as sd[m
+[31m-from scipy.io import wavfile[m
+[31m-[m
+[31m-DEVICE_ID = 16          # Mixage stéréo[m
+[31m-CHANNELS = 2[m
+[31m-DURATION_SEC = 10[m
+[31m-[m
+[31m-def main():[m
+[31m-    dev = sd.query_devices(DEVICE_ID, "input")[m
+[31m-    sr = int(dev["default_samplerate"])[m
+[31m-    print(f"Device: {dev['name']}")[m
+[31m-    print(f"Using samplerate: {sr} Hz")[m
+[31m-[m
+[31m-    q = queue.Queue()[m
+[31m-    frames_total = int(DURATION_SEC * sr)[m
+[31m-    frames_got = 0[m
+[31m-[m
+[31m-    # blocksize plus grand = plus stable (moins d'overflows)[m
+[31m-    blocksize = 2048[m
+[31m-[m
+[31m-    def callback(indata, frames, time_info, status):[m
+[31m-        if status:[m
+[31m-            # Si tu vois overflow ici, c'est une cause directe de crackling[m
+[31m-            print(status)[m
+[31m-        q.put(indata.copy())[m
+[31m-[m
+[31m-    with sd.InputStream([m
+[31m-        device=DEVICE_ID,[m
+[31m-        channels=CHANNELS,[m
+[31m-        samplerate=sr,[m
+[31m-        blocksize=blocksize,[m
+[31m-        latency="high",   # recommandé pour stabilité [docs sounddevice][m
+[31m-        dtype="float32",[m
+[31m-        callback=callback,[m
+[31m-    ):[m
+[31m-        print("Recording...")[m
+[31m-        chunks = [][m
+[31m-        while frames_got < frames_total:[m
+[31m-            data = q.get()[m
+[31m-            chunks.append(data)[m
+[31m-            frames_got += len(data)[m
+[31m-[m
+[31m-    audio = np.concatenate(chunks, axis=0)[:frames_total][m
+[31m-[m
+[31m-    audio_i16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)[m
+[31m-    wavfile.write("stereo_mix_stream.wav", sr, audio_i16)[m
+[31m-    print("Saved: stereo_mix_stream.wav")[m
+[31m-[m
+[31m-if __name__ == "__main__":[m
+[31m-    main()[m
+[1mdiff --git a/sandbox/audio_tests/test_recorder_service.py b/sandbox/audio_tests/test_recorder_service.py[m
+[1mdeleted file mode 100644[m
+[1mindex 69d620d..0000000[m
+[1m--- a/sandbox/audio_tests/test_recorder_service.py[m
+[1m+++ /dev/null[m
+[36m@@ -1,26 +0,0 @@[m
+[31m-from pathlib import Path[m
+[31m-import sys[m
+[31m-import time[m
+[31m-[m
+[31m-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))[m
+[31m-[m
+[31m-from config.secure_store import load_config[m
+[31m-from services.recorder_service import RecorderService[m
+[31m-[m
+[31m-cfg = load_config()[m
+[31m-out_id = cfg["participants_output_device_id"][m
+[31m-mic_id = cfg["micro_device_id"][m
+[31m-[m
+[31m-rec = RecorderService([m
+[31m-    participants_output_device_id=out_id,[m
+[31m-    mic_device_id=mic_id,[m
+[31m-    mp3_bitrate_kbps=256,[m
+[31m-    participants_label="Audio des participants",[m
+[31m-    my_audio_label="Mon audio"[m
+[31m-)[m
+[31m-[m
+[31m-print("START (10s) -> fais jouer YouTube + parle au micro")[m
+[31m-rec.start()[m
+[31m-time.sleep(10)[m
+[31m-rec.stop()[m
+[31m-print("STOP. Va dans Documents\\MeetingTranslator\\<date> et écoute les MP3.")[m
+[1mdiff --git a/src/config/test_secure_store.py b/src/config/test_secure_store.py[m
+[1mindex f8d0d2a..db16988 100644[m
+[1m--- a/src/config/test_secure_store.py[m
+[1m+++ b/src/config/test_secure_store.py[m
+[36m@@ -1,14 +1,26 @@[m
+ from pathlib import Path[m
+ import sys[m
+ [m
+[31m-# Ajoute ...\MeetingTranslator\src au sys.path pour que "config.*" soit importable[m
+ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))[m
+ [m
+ from config.secure_store import load_config, save_config, set_secret, get_secret[m
+ [m
+[32m+[m[32mKEY = "openai_api_key"[m
+[32m+[m[32mTEST_VALUE = "TEST_OPENAI_123"[m
+[32m+[m
+ cfg = load_config()[m
+[31m-set_secret(cfg, "deepl_api_key", "TEST_DEEPL_123")[m
+[32m+[m[32mold = cfg.get(KEY)[m
+[32m+[m
+[32m+[m[32mset_secret(cfg, KEY, TEST_VALUE)[m
+ save_config(cfg)[m
+ [m
+ cfg2 = load_config()[m
+[31m-print("Decrypted:", get_secret(cfg2, "deepl_api_key"))[m
+[32m+[m[32mprint("Decrypted:", get_secret(cfg2, KEY))[m
+[32m+[m
+[32m+[m[32m# Restore l'état précédent[m
+[32m+[m[32mcfg3 = load_config()[m
+[32m+[m[32mif old is None:[m
+[32m+[m[32m    cfg3.pop(KEY, None)[m
+[32m+[m[32melse:[m
+[32m+[m[32m    cfg3[KEY] = old[m
+[32m+[m[32msave_config(cfg3)[m
+[1mdiff --git a/src/main.py b/src/main.py[m
+[1mindex 471c72f..57b01c5 100644[m
+[1m--- a/src/main.py[m
+[1m+++ b/src/main.py[m
+[36m@@ -1,463 +1,463 @@[m
+ from __future__ import annotations[m
+ [m
+[31m-import sys[m
+ import queue[m
+[32m+[m[32mimport sys[m
+ import traceback[m
+ from pathlib import Path[m
+ [m
+[31m-# IMPORTANT: précharger faster_whisper AVANT PyQt5[m
+[31m-try:[m
+[31m-    from faster_whisper import WhisperModel  # noqa: F401[m
+[31m-except Exception:[m
+[31m-    pass[m
+[31m-[m
+[31m-ENABLE_LIVE = True[m
+[31m-[m
+[31m-BASE_DIR = Path(__file__).resolve().parent  # ...\src[m
+[31m-PROJECT_ROOT = BASE_DIR.parent  # ...\ (C:\MeetingTranslatorNetwork)[m
+[31m-[m
+[31m-if str(BASE_DIR) not in sys.path:[m
+[31m-    sys.path.insert(0, str(BASE_DIR))[m
+[31m-[m
+[32m+[m[32mfrom PyQt5.QtCore import QThread, QTimer, pyqtSignal[m
+ from PyQt5.QtWidgets import ([m
+     QApplication,[m
+[31m-    QMainWindow,[m
+[31m-    QVBoxLayout,[m
+[32m+[m[32m    QCheckBox,[m
+[32m+[m[32m    QComboBox,[m
+[32m+[m[32m    QFileDialog,[m
+[32m+[m[32m    QGroupBox,[m
+     QHBoxLayout,[m
+[31m-    QWidget,[m
+[31m-    QPushButton,[m
+     QLabel,[m
+[32m+[m[32m    QMainWindow,[m
+     QMessageBox,[m
+[32m+[m[32m    QPushButton,[m
+     QPlainTextEdit,[m
+[31m-    QInputDialog,[m
+[32m+[m[32m    QSpinBox,[m
+[32m+[m[32m    QTabWidget,[m
+[32m+[m[32m    QVBoxLayout,[m
+[32m+[m[32m    QWidget,[m
+ )[m
+[31m-from PyQt5.QtCore import QTimer, QThread, pyqtSignal[m
+ [m
+[31m-from config.secure_store import load_config, get_secret[m
+[32m+[m[32mfrom config.secure_store import getsecret, load_config, save_config[m
+[32m+[m[32mfrom services.diarization_service import diarize_session[m
+[32m+[m[32mfrom services.meeting_summary_service import generate_meeting_docx[m
+[32m+[m[32mfrom services.postprocess_service import PostProcessConfig[m
+ from services.recorder_service import RecorderService[m
+[31m-from services.meeting_summary_service import MeetingSummaryService[m
+[31m-from services.diarization_service import diarize_session, DiarizationConfig[m
+[31m-from ui.setup_window import SetupWindow[m
+[32m+[m[32mfrom services.live_openai_realtime_transcribe import LiveOpenAIRealtimeTranscribeV2[m
+[32m+[m
+[32m+[m[32mAPP_NAME = "MeetingTranslator"[m
+[32m+[m[32mAPP_VERSION = "2026.01"[m
+[32m+[m[32mDEFAULT_SESSIONS_DIR = Path.home() / "MeetingTranslatorSessions"[m
+ [m
+[31m-LOG_PATH = BASE_DIR / "debug_runtime.log"[m
+[32m+[m[32m# Debug log to file (helps when bundled)[m
+[32m+[m[32mDEBUG_ENABLED = True[m
+[32m+[m[32mLOG_PATH = Path.home() / "MeetingTranslatorNetwork_debug.log"[m
+ [m
+ [m
+ def log_line(msg: str):[m
+[32m+[m[32m    if not DEBUG_ENABLED:[m
+[32m+[m[32m        return[m
+     try:[m
+         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)[m
+         with open(LOG_PATH, "a", encoding="utf-8") as f:[m
+[31m-            f.write(msg.rstrip() + "\n")[m
+[32m+[m[32m            f.write(msg + "\n")[m
+     except Exception:[m
+         pass[m
+ [m
+ [m
+[31m-def excepthook(exc_type, exc, tb):[m
+[31m-    log_line("=== UNCAUGHT EXCEPTION ===")[m
+[31m-    log_line("".join(traceback.format_exception(exc_type, exc, tb)))[m
+[31m-    sys.__excepthook__(exc_type, exc, tb)[m
+[31m-[m
+[31m-[m
+[31m-sys.excepthook = excepthook[m
+[31m-[m
+[31m-[m
+[31m-class RecorderThread(QThread):[m
+[31m-    recording_started = pyqtSignal()[m
+[31m-    recording_stopped = pyqtSignal(str)[m
+[31m-    error_occurred = pyqtSignal(str)[m
+[31m-[m
+[31m-    def __init__(self, recorder: RecorderService):[m
+[31m-        super().__init__()[m
+[31m-        self.recorder = recorder[m
+[31m-        self.action = None[m
+[31m-[m
+[31m-    def set_action(self, action: str):[m
+[31m-        self.action = action[m
+[31m-[m
+[31m-    def run(self):[m
+[31m-        try:[m
+[31m-            if self.action == "start":[m
+[31m-                self.recorder.start()[m
+[31m-                self.recording_started.emit()[m
+[31m-            elif self.action == "stop":[m
+[31m-                self.recorder.stop()[m
+[31m-                session_path = str(self.recorder.session_dir) if self.recorder.session_dir else ""[m
+[31m-                self.recording_stopped.emit(session_path)[m
+[31m-        except Exception as e:[m
+[31m-            log_line("=== RecorderThread exception ===")[m
+[31m-            log_line(traceback.format_exc())[m
+[31m-            self.error_occurred.emit(str(e))[m
+[31m-[m
+[31m-[m
+ class PostProcessThread(QThread):[m
+[31m-    status = pyqtSignal(str)[m
+[31m-    done = pyqtSignal(str)[m
+[31m-    error = pyqtSignal(str)[m
+[32m+[m[32m    finished_ok = pyqtSignal(str)  # transcript_path[m
+[32m+[m[32m    failed = pyqtSignal(str)[m
+ [m
+[31m-    def __init__(self, cfg: dict, session_dir: Path, language: str, quality: str, parent=None):[m
+[32m+[m[32m    def __init__(self, cfg: dict, recorder: RecorderService, session_dir: Path, parent=None):[m
+         super().__init__(parent)[m
+         self.cfg = cfg[m
+[32m+[m[32m        self.recorder = recorder[m
+         self

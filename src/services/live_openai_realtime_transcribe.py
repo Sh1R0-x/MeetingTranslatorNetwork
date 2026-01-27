@@ -2,245 +2,227 @@ from __future__ import annotations
 
 import base64
 import json
-import threading
-import time
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional, Tuple
+import sys
+from pathlib import Path
+from typing import Callable, Optional
 
-import requests
-import websocket
-from PyQt5.QtCore import QThread, pyqtSignal
+import websockets
+from openai import OpenAI
 
+BASE_DIR = Path(__file__).resolve().parents[1]
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
-@dataclass
-class LiveOpenAIRealtimeConfig:
-    # Transcription
-    model: str = "gpt-4o-mini-transcribe"  # meilleur streaming delta que whisper-1
-    language: str = "auto"  # "auto" | "fr" | "en"
-    commit_ms: int = 1500  # on commit souvent => texte quasi continu
-
-    # Traduction
-    translate_to_fr: bool = True
-    translation_model: str = "gpt-4o-mini"
+from config.secure_store import loadconfig, getsecret
 
 
-class LiveOpenAIRealtimeThread(QThread):
-    new_line = pyqtSignal(str)
-    status = pyqtSignal(str)
-    error = pyqtSignal(str)
+class LiveOpenAIRealtimeTranscribeV2:
+    """
+    Client OpenAI Realtime (WebSocket) pour transcription LIVE.
+
+    Points importants (fiabilité) :
+    - Envoyer de l'audio en PCM16 MONO 24 kHz.
+      La conversion (stéréo->mono + resample->24k) est faite côté main.py avant l'envoi.
+    - Pour obtenir des transcriptions "final", il faut :
+        * Server VAD (turn_detection=server_vad) OU
+        * input_audio_buffer.commit() (manuel)
+      Ici on active Server VAD par défaut, et on garde commit_audio() en fallback.
+    """
 
     def __init__(
         self,
-        audio_q: "queue.Queue[Optional[Tuple[bytes, int]]]",
-        input_samplerate: int,
-        input_channels: int,
-        openai_api_key: str,
-        cfg: Optional[LiveOpenAIRealtimeConfig] = None,
-        parent=None,
+        api_key: Optional[str] = None,
+        realtime_model: str = "gpt-4o-realtime-preview-2024-12-26",
+        transcribe_model: str = "gpt-4o-mini-transcribe",
+        translate_model: str = "gpt-4o-mini",
+        source_language: str = "auto",  # auto, fr, en
+        enable_server_vad: bool = True,
     ):
-        super().__init__(parent)
-        self.audio_q = audio_q
-        self.input_samplerate = int(input_samplerate)
-        self.input_channels = int(input_channels)
-        self.openai_api_key = (openai_api_key or "").strip()
-        self.cfg = cfg or LiveOpenAIRealtimeConfig()
+        if api_key:
+            self.api_key = api_key
+        else:
+            cfg = loadconfig()
+            self.api_key = getsecret(cfg, "openai_api_key") or ""
 
-        self._stop_evt = threading.Event()
-        self._ws = None
-        self._ws_open = threading.Event()
+        if not self.api_key:
+            raise ValueError("OpenAI API key manquante (Setup -> OpenAI API Key).")
 
-        # cache anti spam
-        self._last_src = ""
-        self._last_fr = ""
+        self.realtime_model = realtime_model
+        self.transcribe_model = transcribe_model
+        self.translate_model = translate_model
+        self.source_language = (source_language or "auto").lower().strip()
+        self.enable_server_vad = bool(enable_server_vad)
 
-    def stop(self):
-        self._stop_evt.set()
+        self.client = OpenAI(api_key=self.api_key)
+
+        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.is_connected = False
+
+        # Callbacks
+        # on_transcript(lang, src_text, fr_text)
+        self.on_transcript: Optional[Callable[[str, Optional[str], str], None]] = None
+        self.on_partial: Optional[Callable[[str], None]] = None
+        self.on_error: Optional[Callable[[str], None]] = None
+
+    async def connect(self) -> bool:
         try:
-            self.audio_q.put_nowait(None)
-        except Exception:
-            pass
-        try:
-            if self._ws is not None:
-                self._ws.close()
-        except Exception:
-            pass
-
-    def _translate_to_fr(self, text: str) -> str:
-        if not self.cfg.translate_to_fr:
-            return ""
-
-        txt = (text or "").strip()
-        if not txt:
-            return ""
-
-        # Astuce simple: on demande "si déjà FR, renvoie inchangé"
-        prompt = (
-            "Tu es un traducteur.\n"
-            "Traduis ce texte en français.\n"
-            "Si le texte est déjà en français, renvoie exactement le même texte sans le modifier.\n\n"
-            f"TEXTE:\n{txt}"
-        )
-
-        try:
-            r = requests.post(
-                "https://api.openai.com/v1/responses",
-                headers={
-                    "Authorization": f"Bearer {self.openai_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.cfg.translation_model,
-                    "input": prompt,
-                },
-                timeout=30,
-            )
-            r.raise_for_status()
-            data = r.json()
-
-            # extraction best-effort du texte
-            out = ""
-            for item in data.get("output", []) or []:
-                for c in item.get("content", []) or []:
-                    if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
-                        out = (c.get("text") or "").strip()
-                        if out:
-                            return out
-            return ""
-        except Exception:
-            return ""
-
-    def _emit_src_fr(self, src: str, fr: str):
-        ts = datetime.now().strftime("%H:%M:%S")
-        if src:
-            self.new_line.emit(f"{ts} | SRC: {src}")
-        if fr:
-            self.new_line.emit(f"{ts} | FR:  {fr}")
-        self.new_line.emit("")
-
-    def run(self):
-        if not self.openai_api_key:
-            self.error.emit("OpenAI API Key manquante (Setup -> Clés API).")
-            return
-
-        # URL & headers OpenAI Realtime (transcription)
-        # URL: wss://api.openai.com/v1/realtime?intent=transcription
-        # Headers: Authorization + OpenAI-Beta: realtime=v1
-        url = "wss://api.openai.com/v1/realtime?intent=transcription"
-        headers = [
-            "Authorization: Bearer " + self.openai_api_key,
-            "OpenAI-Beta: realtime=v1",
-        ]
-
-        def on_open(ws):
-            self._ws_open.set()
-            self.status.emit("Live OpenAI: connecté.")
-
-            lang = "" if self.cfg.language == "auto" else self.cfg.language
-
-            # On désactive la VAD serveur (turn_detection=null) et on commit nous-mêmes souvent
-            # => ça donne un rendu plus "continu".
-            msg = {
-                "type": "transcription_session.update",
-                "input_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": self.cfg.model,
-                    "prompt": "",
-                    "language": lang,
-                },
-                "turn_detection": None,
-                "input_audio_noise_reduction": {"type": "near_field"},
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "OpenAI-Beta": "realtime=v1",
             }
+
+            uri = f"wss://api.openai.com/v1/realtime?model={self.realtime_model}"
+            self.ws = await websockets.connect(
+                uri,
+                subprotocols=["realtime"],
+                extra_headers=headers,
+                ping_interval=20,
+                ping_timeout=20,
+            )
+            self.is_connected = True
+
+            transcription_cfg = {"model": self.transcribe_model}
+            if self.source_language in ("fr", "en"):
+                transcription_cfg["language"] = self.source_language
+
+            # IMPORTANT: pcm16 => 24kHz mono (côté envoi)
+            session = {
+                "modalities": ["text", "audio"],
+                "input_audio_format": "pcm16",
+                "input_audio_transcription": transcription_cfg,
+            }
+            if self.enable_server_vad:
+                session["turn_detection"] = {"type": "server_vad"}
+
+            await self.ws.send(json.dumps({"type": "session.update", "session": session}))
+            return True
+
+        except Exception as e:
+            self.is_connected = False
+            self.ws = None
+            if self.on_error:
+                self.on_error(f"[Realtime] Connection failed: {e}")
+            return False
+
+    async def disconnect(self) -> None:
+        if self.ws:
             try:
-                ws.send(json.dumps(msg))
-            except Exception as e:
-                self.error.emit(str(e))
-
-        def on_message(_ws, message):
-            try:
-                data = json.loads(message)
-            except Exception:
-                return
-
-            t = data.get("type", "")
-
-            # Le guide indique de lire delta + completed
-            # delta = incrémental pour gpt-4o-transcribe / gpt-4o-mini-transcribe
-            # completed = phrase finalisée
-            if t == "conversation.item.input_audio_transcription.completed":
-                src = (data.get("transcript") or "").strip()
-                if not src:
-                    return
-
-                # anti doublons
-                if src == self._last_src:
-                    return
-                self._last_src = src
-
-                fr = self._translate_to_fr(src).strip()
-                if fr and fr == self._last_fr:
-                    fr = ""
-                if fr:
-                    self._last_fr = fr
-
-                self._emit_src_fr(src, fr)
-                return
-
-            if t == "error":
-                err = data.get("error", {}).get("message") or str(data)
-                self.error.emit(err)
-                return
-
-        def on_error(_ws, err):
-            self.error.emit(str(err))
-
-        def on_close(_ws, status_code, msg):
-            self.status.emit("Live OpenAI: déconnecté.")
-
-        self._ws = websocket.WebSocketApp(
-            url,
-            header=headers,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close,
-        )
-
-        t_ws = threading.Thread(target=lambda: self._ws.run_forever(), daemon=True)
-        t_ws.start()
-
-        if not self._ws_open.wait(timeout=10):
-            self.error.emit("Impossible de se connecter au serveur OpenAI Realtime.")
-            return
-
-        last_commit = time.monotonic()
-
-        # loop audio -> input_audio_buffer.append + commit régulier
-        while not self._stop_evt.is_set():
-            item = self.audio_q.get()
-            if item is None:
-                break
-
-            in_data, _frame_count = item
-            if not in_data:
-                continue
-
-            try:
-                audio_b64 = base64.b64encode(in_data).decode("utf-8")
-                self._ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64}))
+                await self.ws.close()
             except Exception:
                 pass
+        self.ws = None
+        self.is_connected = False
 
-            now = time.monotonic()
-            if (now - last_commit) * 1000.0 >= float(self.cfg.commit_ms):
-                last_commit = now
-                try:
-                    self._ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                except Exception:
-                    pass
+    async def append_audio_pcm16(self, audio_bytes_pcm16: bytes) -> None:
+        """Envoie un chunk PCM16 (MONO 24 kHz idéalement)."""
+        if not self.is_connected or not self.ws:
+            return
+        if not audio_bytes_pcm16:
+            return
+        try:
+            b64 = base64.b64encode(audio_bytes_pcm16).decode("ascii")
+            await self.ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": b64}))
+        except Exception as e:
+            if self.on_error:
+                self.on_error(f"[Realtime] append_audio failed: {e}")
+
+    async def commit_audio(self) -> None:
+        """Fallback si VAD off : commit pour déclencher une transcription."""
+        if not self.is_connected or not self.ws:
+            return
+        try:
+            await self.ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        except Exception as e:
+            if self.on_error:
+                self.on_error(f"[Realtime] commit_audio failed: {e}")
+
+    async def listen(self) -> None:
+        """Boucle de réception des events serveur."""
+        if not self.is_connected or not self.ws:
+            return
 
         try:
-            if self._ws is not None:
-                self._ws.close()
+            async for msg_str in self.ws:
+                try:
+                    msg = json.loads(msg_str)
+                except Exception:
+                    continue
+
+                t = msg.get("type", "")
+
+                if t == "error":
+                    err = msg.get("error") or {}
+                    message = err.get("message") or str(err) or "Unknown error"
+                    if self.on_error:
+                        self.on_error(f"[Realtime] {message}")
+                    continue
+
+                if t == "conversation.item.input_audio_transcription.delta":
+                    transcript = (msg.get("transcript") or "").strip()
+                    if transcript and self.on_partial:
+                        self.on_partial(transcript)
+                    continue
+
+                if t == "conversation.item.input_audio_transcription.completed":
+                    transcript = (msg.get("transcript") or "").strip()
+                    if transcript:
+                        await self._process_final_transcript(transcript)
+                    continue
+
+        except Exception as e:
+            if self.on_error:
+                self.on_error(f"[Realtime] listen error: {e}")
+        finally:
+            self.is_connected = False
+
+    async def _process_final_transcript(self, text: str) -> None:
+        try:
+            if self.source_language == "fr":
+                if self.on_transcript:
+                    self.on_transcript("FR", None, text)
+                return
+
+            if self.source_language == "en":
+                fr = self._translate_en_to_fr(text)
+                if self.on_transcript:
+                    self.on_transcript("EN", text, fr)
+                return
+
+            detected = self._detect_lang_en_fr(text)
+            if detected == "EN":
+                fr = self._translate_en_to_fr(text)
+                if self.on_transcript:
+                    self.on_transcript("EN", text, fr)
+            else:
+                if self.on_transcript:
+                    self.on_transcript("FR", None, text)
+        except Exception as e:
+            if self.on_error:
+                self.on_error(f"[Realtime] process transcript error: {e}")
+
+    def _detect_lang_en_fr(self, text: str) -> str:
+        try:
+            r = self.client.chat.completions.create(
+                model=self.translate_model,
+                temperature=0,
+                messages=[
+                    {"role": "user", "content": "Réponds uniquement par EN ou FR. Langue de ce texte :\n" + text},
+                ],
+            )
+            out = (r.choices[0].message.content or "").strip().upper()
+            return "EN" if out.startswith("EN") else "FR"
         except Exception:
-            pass
+            return "FR"
+
+    def _translate_en_to_fr(self, en_text: str) -> str:
+        try:
+            r = self.client.chat.completions.create(
+                model=self.translate_model,
+                temperature=0,
+                messages=[
+                    {"role": "user", "content": "Traduis en français naturel, sans ajouter de contexte :\n" + en_text},
+                ],
+            )
+            return (r.choices[0].message.content or "").strip()
+        except Exception:
+            return en_text

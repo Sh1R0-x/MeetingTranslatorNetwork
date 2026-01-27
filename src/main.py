@@ -1,463 +1,523 @@
 from __future__ import annotations
 
-import sys
 import queue
+import sys
 import traceback
 from pathlib import Path
 
-# IMPORTANT: précharger faster_whisper AVANT PyQt5
-try:
-    from faster_whisper import WhisperModel  # noqa: F401
-except Exception:
-    pass
-
-ENABLE_LIVE = True
-
-BASE_DIR = Path(__file__).resolve().parent  # ...\src
-PROJECT_ROOT = BASE_DIR.parent  # ...\ (C:\MeetingTranslatorNetwork)
-
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
-
+from PyQt5.QtCore import QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
-    QMainWindow,
-    QVBoxLayout,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QGroupBox,
     QHBoxLayout,
-    QWidget,
-    QPushButton,
     QLabel,
+    QMainWindow,
     QMessageBox,
+    QPushButton,
     QPlainTextEdit,
-    QInputDialog,
+    QSpinBox,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt5.QtCore import QTimer, QThread, pyqtSignal
 
-from config.secure_store import load_config, get_secret
+from config.secure_store import getsecret, load_config, save_config
+from services.diarization_service import diarize_session
+from services.meeting_summary_service import generate_meeting_docx
+from services.postprocess_service import PostProcessConfig
 from services.recorder_service import RecorderService
-from services.meeting_summary_service import MeetingSummaryService
-from services.diarization_service import diarize_session, DiarizationConfig
-from ui.setup_window import SetupWindow
+from services.live_openai_realtime_transcribe import LiveOpenAIRealtimeTranscribeV2
 
-LOG_PATH = BASE_DIR / "debug_runtime.log"
+APP_NAME = "MeetingTranslator"
+APP_VERSION = "2026.01"
+DEFAULT_SESSIONS_DIR = Path.home() / "MeetingTranslatorSessions"
+
+# Debug log to file (helps when bundled)
+DEBUG_ENABLED = True
+LOG_PATH = Path.home() / "MeetingTranslatorNetwork_debug.log"
 
 
 def log_line(msg: str):
+    if not DEBUG_ENABLED:
+        return
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(msg.rstrip() + "\n")
+            f.write(msg + "\n")
     except Exception:
         pass
 
 
-def excepthook(exc_type, exc, tb):
-    log_line("=== UNCAUGHT EXCEPTION ===")
-    log_line("".join(traceback.format_exception(exc_type, exc, tb)))
-    sys.__excepthook__(exc_type, exc, tb)
-
-
-sys.excepthook = excepthook
-
-
-class RecorderThread(QThread):
-    recording_started = pyqtSignal()
-    recording_stopped = pyqtSignal(str)
-    error_occurred = pyqtSignal(str)
-
-    def __init__(self, recorder: RecorderService):
-        super().__init__()
-        self.recorder = recorder
-        self.action = None
-
-    def set_action(self, action: str):
-        self.action = action
-
-    def run(self):
-        try:
-            if self.action == "start":
-                self.recorder.start()
-                self.recording_started.emit()
-            elif self.action == "stop":
-                self.recorder.stop()
-                session_path = str(self.recorder.session_dir) if self.recorder.session_dir else ""
-                self.recording_stopped.emit(session_path)
-        except Exception as e:
-            log_line("=== RecorderThread exception ===")
-            log_line(traceback.format_exc())
-            self.error_occurred.emit(str(e))
-
-
 class PostProcessThread(QThread):
-    status = pyqtSignal(str)
-    done = pyqtSignal(str)
-    error = pyqtSignal(str)
+    finished_ok = pyqtSignal(str)  # transcript_path
+    failed = pyqtSignal(str)
 
-    def __init__(self, cfg: dict, session_dir: Path, language: str, quality: str, parent=None):
+    def __init__(self, cfg: dict, recorder: RecorderService, session_dir: Path, parent=None):
         super().__init__(parent)
         self.cfg = cfg
+        self.recorder = recorder
         self.session_dir = Path(session_dir)
-        self.language = language  # "fr" | "en" | "auto"
-        self.quality = quality  # "standard" | "precise"
 
     def run(self):
         try:
-            hf_token = get_secret(self.cfg, "hf_token") or ""
+            hf_token = getsecret(self.cfg, "hf_token") or ""
             if not hf_token:
-                raise RuntimeError("HuggingFace token manquant (Setup -> HuggingFace Token).")
+                log_line("[PostProcess] ⚠ HuggingFace token absent : diarization pyannote sera désactivée (fallback 1 speaker).")
 
-            pplx = get_secret(self.cfg, "perplexityapikey") or ""
+            language = (self.cfg.get("postprocess_language") or "auto").lower()
+            quality = (self.cfg.get("whisper_quality") or "standard").lower()
+            generate_docx = bool(self.cfg.get("generate_docx", True))
 
-            self.status.emit("Post-process: diarization + transcription (2-10 min)...")
+            log_line(f"[PostProcess] language={language} quality={quality} docx={generate_docx}")
 
-            model_size = "small" if self.quality == "standard" else "medium"
-            dcfg = DiarizationConfig(
-                model_size=model_size,
-                device="auto",
-                compute_type="int8",
-                beam_size=5,
-                vad_filter=True,
-                vad_min_silence_ms=400,
+            pp_cfg = PostProcessConfig(
+                language=language,
+                quality=quality,
+                enable_docx=generate_docx,
             )
 
             transcript_path = diarize_session(
-                self.session_dir,
-                hf_token=hf_token,
-                language=self.language,
-                cfg=dcfg,
-            )
-
-            self.status.emit(f"Transcription OK: {transcript_path.name}")
-
-            svc = MeetingSummaryService(perplexity_api_key=pplx)
-            docx_path = svc.generate_meeting_docx(
+                wav_path=self.recorder.wav_path,
+                mic_wav_path=self.recorder.mic_wav_path,
                 session_dir=self.session_dir,
-                transcript_path=transcript_path,
-                title="Résumé de Réunion",
-                participants="N/A",
+                hf_token=hf_token,
+                cfg=pp_cfg,
             )
 
-            self.status.emit(f"DOCX généré: {docx_path.name}")
-            self.done.emit(f"Terminé ! Fichiers en:\n{self.session_dir}")
+            # DOCX generation
+            if generate_docx:
+                try:
+                    generate_meeting_docx(
+                        transcript_path=Path(transcript_path),
+                        session_dir=self.session_dir,
+                        cfg=self.cfg,
+                    )
+                except Exception as e:
+                    log_line(f"[PostProcess] DOCX generation error: {e}")
 
-        except Exception as e:
-            self.error.emit(str(e))
+            self.finished_ok.emit(str(transcript_path))
+
+        except Exception:
+            err = traceback.format_exc()
+            log_line("=== PostProcessThread exception ===\n" + err)
+            self.failed.emit(err)
 
 
-class MeetingWindow(QMainWindow):
-    def __init__(self, config: dict):
-        super().__init__()
-        self.setWindowTitle("MeetingTranslator - Réunion")
-        self.setMinimumSize(900, 650)
+class LiveOpenAIThread(QThread):
+    live_line = pyqtSignal(str)
+    status = pyqtSignal(str)
 
-        self.cfg = config
+    def __init__(
+        self,
+        cfg: dict,
+        recorder: RecorderService,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.recorder = recorder
 
-        self._build_recorder()
+        self._stop_flag = False
+        self._transcriber: LiveOpenAIRealtimeTranscribeV2 | None = None
 
-        self.recorder_thread = RecorderThread(self.recorder)
-        self.recorder_thread.recording_started.connect(self.on_recording_started)
-        self.recorder_thread.recording_stopped.connect(self.on_recording_stopped)
-        self.recorder_thread.error_occurred.connect(self.on_error)
+        self.commit_every_seconds = float(self.cfg.get("live_commit_every", 1.0))
+        self.input_samplerate = int(self.recorder.participants_rate or 48000)
+        self.input_channels = int(self.recorder.participants_channels or 2)
 
-        # LIVE
-        self._live_q = None
-        self._live_thread = None
-        self._live_error_shown = False
-
-        # Post-process
-        self._pp_thread = None
-
-        # UI
-        central = QWidget()
-        layout = QVBoxLayout()
-
-        layout.addWidget(QLabel("Enregistrement Réunion"))
-
-        self.status_label = QLabel("Statut: Prêt")
-        layout.addWidget(self.status_label)
-
-        self.duration_label = QLabel("Durée: 00:00:00")
-        layout.addWidget(self.duration_label)
-
-        btn_layout = QHBoxLayout()
-
-        self.btn_start = QPushButton("Démarrer")
-        self.btn_start.setMinimumHeight(50)
-        self.btn_start.setStyleSheet("background-color: #2ecc71; color: white; font-weight: bold;")
-        self.btn_start.clicked.connect(self.start_recording)
-        btn_layout.addWidget(self.btn_start)
-
-        self.btn_stop = QPushButton("Arrêter")
-        self.btn_stop.setMinimumHeight(50)
-        self.btn_stop.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self.stop_recording)
-        btn_layout.addWidget(self.btn_stop)
-
-        layout.addLayout(btn_layout)
-
-        self.btn_setup = QPushButton("Setup Devices/API")
-        self.btn_setup.clicked.connect(self.open_setup)
-        layout.addWidget(self.btn_setup)
-
-        layout.addWidget(QLabel("Live (Participants) :"))
-        self.live_log = QPlainTextEdit()
-        self.live_log.setReadOnly(True)
-        self.live_log.setMaximumBlockCount(3000)
-        layout.addWidget(self.live_log)
-
-        central.setLayout(layout)
-        self.setCentralWidget(central)
-
-        self.duration_seconds = 0
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_duration)
-
-    def _get_cfg_device_ids(self):
-        part_id = self.cfg.get("participants_output_device_id")
-        if part_id is None:
-            part_id = self.cfg.get("participantsoutputdeviceid")
-
-        mic_id = self.cfg.get("micro_device_id")
-        if mic_id is None:
-            mic_id = self.cfg.get("microdeviceid")
-
-        if part_id is None or mic_id is None:
-            raise RuntimeError("IDs devices manquants. Ouvre Setup Devices/API puis Enregistrer.")
-
-        return int(part_id), int(mic_id)
-
-    def _build_recorder(self):
-        part_id, mic_id = self._get_cfg_device_ids()
-
-        # ✅ On force la sortie dans le dossier du projet:
-        # C:\MeetingTranslatorNetwork\recordings\DD-MM-YYYY\HHhMMmSSs\...
-        output_root = PROJECT_ROOT / "recordings"
-        output_root.mkdir(parents=True, exist_ok=True)
-
-        self.recorder = RecorderService(
-            participants_output_device_id=part_id,
-            mic_device_id=mic_id,
-            output_root=output_root,
-        )
-
-    def _start_live_translation(self):
-        if self._live_thread is not None:
-            return
-
-        from services.live_translate_service import LiveTranslateThread, LiveTranslateConfig
-
-        if self._live_q is None:
-            raise RuntimeError("Queue live non initialisée.")
-
-        if not self.recorder.participants_rate or not self.recorder.participants_channels:
-            raise RuntimeError("Participants rate/channels non initialisés (start recorder d'abord).")
-
-        cfg = LiveTranslateConfig(
-            src_lang="en",
-            tgt_lang="fr",
-            model_size="base",
-            compute_type="float32",
-            device="cpu",
-            openai_api_key=(get_secret(self.cfg, "openaiapikey") or ""),
-        )
-
-        self._live_thread = LiveTranslateThread(
-            audio_q=self._live_q,
-            input_samplerate=self.recorder.participants_rate,
-            input_channels=self.recorder.participants_channels,
-            cfg=cfg,
-        )
-
-        self._live_thread.new_line.connect(self.live_log.appendPlainText)
-        self._live_thread.error.connect(lambda msg: QMessageBox.critical(self, "Live translate error", msg))
-        self._live_thread.start()
-
-    def _stop_live_translation(self):
-        if self._live_thread is not None:
-            try:
-                self._live_thread.stop()
-                self._live_thread.wait(3000)
-            except Exception:
-                pass
-        self._live_thread = None
-
+    def stop(self):
+        self._stop_flag = True
         try:
-            self.recorder.set_live_participants_queue(None)
+            if self._transcriber:
+                self._transcriber.stop()
         except Exception:
             pass
 
-        self._live_q = None
+    def _on_transcript(self, lang: str, src_text: str, fr_text: str):
+        # Simplify output: show French if available otherwise src
+        if fr_text:
+            line = f"[{lang}] {fr_text}"
+        else:
+            line = f"[{lang}] {src_text}"
+        self.live_line.emit(line)
 
-    def start_recording(self):
-        try:
-            self.btn_start.setEnabled(False)
-            self.btn_stop.setEnabled(True)
-            self.status_label.setText("Statut: Démarrage...")
+    def run(self):
+        import asyncio
 
-            self.duration_seconds = 0
-            self.timer.start(1000)
-
-            self._live_q = queue.Queue(maxsize=300)
-            self.recorder.set_live_participants_queue(self._live_q)
-
-            self.recorder_thread.set_action("start")
-            self.recorder_thread.start()
-
-        except Exception as e:
-            log_line("=== start_recording exception ===")
-            log_line(traceback.format_exc())
-            self.status_label.setText(f"Erreur: {e}")
-            self.btn_start.setEnabled(True)
-            self.btn_stop.setEnabled(False)
-
-    def stop_recording(self):
-        try:
-            self.btn_stop.setEnabled(False)
-            self.status_label.setText("Statut: Arrêt...")
-            self.timer.stop()
-
-            self._stop_live_translation()
-
-            self.recorder_thread.set_action("stop")
-            self.recorder_thread.start()
-
-        except Exception as e:
-            log_line("=== stop_recording exception ===")
-            log_line(traceback.format_exc())
-            self.status_label.setText(f"Erreur: {e}")
-
-    def on_recording_started(self):
-        self.status_label.setText("Enregistrement en cours...")
-
-        if not ENABLE_LIVE:
-            self.live_log.appendPlainText("Live disabled (ENABLE_LIVE=False).")
-            self.live_log.appendPlainText("")
-            return
-
-        try:
-            self._start_live_translation()
-        except Exception as e:
-            msg = f"Live OFF: {e}"
-            self.live_log.appendPlainText(msg)
-            self.live_log.appendPlainText("")
-            if not self._live_error_shown:
-                self._live_error_shown = True
-                QMessageBox.critical(self, "Live translate error", str(e))
-
-    def on_recording_stopped(self, session_path: str):
-        self.timer.stop()
-
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-
-        self._stop_live_translation()
-
-        if not session_path:
-            self.status_label.setText("Terminé, mais session_dir vide (erreur ?)")
-            return
-
-        if bool(self.cfg.get("enable_diarization", False)):
-            lang_choice, ok = QInputDialog.getItem(
-                self,
-                "Langue réunion (post-process)",
-                "Choisir :",
-                ["MIX (auto)", "FR", "EN"],
-                0,
-                False,
-            )
-
-            if not ok:
-                self.status_label.setText(f"Terminé ! Fichiers en:\n{session_path}")
+        async def _runner():
+            api_key = getsecret(self.cfg, "openai_api_key") or ""
+            if not api_key:
+                self.status.emit("⚠ OpenAI API key manquante (Setup)")
                 return
 
-            language = "auto"
-            if lang_choice == "FR":
-                language = "fr"
-            elif lang_choice == "EN":
-                language = "en"
-
-            qual_choice, ok2 = QInputDialog.getItem(
-                self,
-                "Qualité (post-process)",
-                "Choisir :",
-                ["STANDARD (plus rapide)", "PRECISE (meilleur)"],
-                0,
-                False,
+            self.status.emit("Live: connexion OpenAI Realtime...")
+            self._transcriber = LiveOpenAIRealtimeTranscribeV2(
+                api_key=api_key,
+                input_samplerate=self.input_samplerate,
+                input_channels=self.input_channels,
+                commit_every_seconds=self.commit_every_seconds,
+                source_language=(self.cfg.get("live_source_language") or "auto"),
+                on_transcript=self._on_transcript,
             )
 
-            quality = "standard"
-            if ok2 and qual_choice.startswith("PRECISE"):
-                quality = "precise"
+            try:
+                await self._transcriber.start()
+            except Exception as e:
+                self.status.emit(f"Live: erreur connexion ({e})")
+                return
 
-            self.status_label.setText("Statut: post-process en cours (2-10 min)...")
+            self.status.emit("Live: prêt (streaming audio)")
+
+            frames_since_commit = 0
+            seconds = 0.0
+
+            while not self._stop_flag:
+                try:
+                    item = self.recorder.live_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+
+                if item is None:
+                    break
+
+                data_bytes, frames = item
+                frames = int(frames) if frames else 0
+
+                if not data_bytes or frames <= 0:
+                    continue
+                # --- Conversion Realtime ---
+                # OpenAI Realtime est bien plus stable avec du PCM16 MONO 24kHz.
+                # Ici on convertit (si nécessaire) le flux loopback (souvent 48kHz stéréo).
+                import audioop
+
+                target_sr = 24000
+                target_ch = 1
+
+                # Downmix stéréo -> mono (si besoin)
+                if self.input_channels and self.input_channels != target_ch:
+                    try:
+                        data_bytes = audioop.tomono(data_bytes, 2, 0.5, 0.5)
+                    except Exception:
+                        pass
+
+                # Resample -> 24kHz (si besoin) en conservant l'état entre chunks
+                if not hasattr(self, "_ratecv_state"):
+                    self._ratecv_state = None
+
+                if self.input_samplerate and self.input_samplerate != target_sr:
+                    try:
+                        data_bytes, self._ratecv_state = audioop.ratecv(
+                            data_bytes, 2, 1, self.input_samplerate, target_sr, self._ratecv_state
+                        )
+                    except Exception:
+                        # Si échec, on envoie tel quel (moins fiable, mais évite de bloquer)
+                        pass
+
+                frames_out = len(data_bytes) // 2  # 2 bytes par sample PCM16 mono
+
+                await self._transcriber.append_audio_pcm16(data_bytes)
+                frames_since_commit += frames_out
+
+                if target_sr > 0:
+                    seconds = frames_since_commit / float(target_sr)
+                    if seconds >= self.commit_every_seconds:
+                        await self._transcriber.commit_audio()
+                        frames_since_commit = 0
+                        seconds = 0.0
+
+            try:
+                await self._transcriber.stop_async()
+            except Exception:
+                pass
+
+            self.status.emit("Live: arrêté")
+
+        try:
+            asyncio.run(_runner())
+        except Exception:
+            err = traceback.format_exc()
+            log_line("=== LiveOpenAIThread exception ===\n" + err)
+            self.status.emit("Live: erreur (voir log)")
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
+
+        self.cfg = load_config()
+
+        # Live queue (participants) consumed by LiveOpenAIThread
+        self.live_queue = queue.Queue(maxsize=300)
+
+        # Device ids are saved by SetupWindow
+        po = self.cfg.get("participantsoutputdeviceid", None)
+        mi = self.cfg.get("microdeviceid", None)
+        if po is None or mi is None:
+            raise RuntimeError(
+                "Configuration audio manquante : ouvre Configuration et sélectionne "
+                "la sortie Windows (participants) et le micro."
+            )
+
+        sessions_dir = Path(self.cfg.get("sessions_dir") or DEFAULT_SESSIONS_DIR)
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        self.recorder = RecorderService(
+            participants_output_device_id=int(po),
+            mic_device_id=int(mi),
+            output_root=sessions_dir,
+        )
+
+        # Plug live participants queue
+        self.recorder.set_live_participants_queue(self.live_queue)
+        # Keep attribute name used by LiveOpenAIThread
+        self.recorder.live_queue = self.live_queue
+
+        self.session_dir = None
+
+        self.live_thread: LiveOpenAIThread | None = None
+        self.pp_thread: PostProcessThread | None = None
+
+        self._build_ui()
+        self._apply_cfg_to_ui()
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick_timer)
+        self._seconds = 0
+
+    def _build_ui(self):
+        root = QWidget()
+        layout = QVBoxLayout()
+
+        # Buttons row
+        buttons = QHBoxLayout()
+        self.btn_start = QPushButton("Démarrer")
+        self.btn_stop = QPushButton("Arrêter")
+        self.btn_stop.setEnabled(False)
+        self.btn_setup = QPushButton("Configuration")
+        buttons.addWidget(self.btn_start)
+        buttons.addWidget(self.btn_stop)
+        buttons.addWidget(self.btn_setup)
+        layout.addLayout(buttons)
+
+        # Duration
+        self.lbl_duration = QLabel("Durée: 00:00:00")
+        layout.addWidget(self.lbl_duration)
+
+        # Options group
+        opt = QGroupBox("Options")
+        opt_l = QHBoxLayout()
+
+        self.chk_live = QCheckBox("Live OpenAI")
+        self.chk_docx = QCheckBox("Générer DOCX")
+
+        self.cmb_lang = QComboBox()
+        self.cmb_lang.addItems(["auto", "fr", "en"])
+
+        self.cmb_quality = QComboBox()
+        self.cmb_quality.addItems(["standard", "precise"])
+
+        opt_l.addWidget(self.chk_live)
+        opt_l.addWidget(self.chk_docx)
+        opt_l.addWidget(QLabel("Langue:"))
+        opt_l.addWidget(self.cmb_lang)
+        opt_l.addWidget(QLabel("Qualité:"))
+        opt_l.addWidget(self.cmb_quality)
+
+        opt.setLayout(opt_l)
+        layout.addWidget(opt)
+
+        # Tabs (Live / Debug)
+        self.tabs = QTabWidget()
+        self.txt_live = QPlainTextEdit()
+        self.txt_live.setReadOnly(True)
+
+        self.txt_debug = QPlainTextEdit()
+        self.txt_debug.setReadOnly(True)
+
+        self.tabs.addTab(self.txt_live, "Live")
+        self.tabs.addTab(self.txt_debug, "Debug")
+        layout.addWidget(self.tabs)
+
+        root.setLayout(layout)
+        self.setCentralWidget(root)
+
+        self.btn_start.clicked.connect(self._on_start)
+        self.btn_stop.clicked.connect(self._on_stop)
+        self.btn_setup.clicked.connect(self._on_setup)
+
+        self.chk_live.stateChanged.connect(self._on_cfg_changed)
+        self.chk_docx.stateChanged.connect(self._on_cfg_changed)
+        self.cmb_lang.currentTextChanged.connect(self._on_cfg_changed)
+        self.cmb_quality.currentTextChanged.connect(self._on_cfg_changed)
+
+    def _apply_cfg_to_ui(self):
+        self.chk_live.setChecked(bool(self.cfg.get("enable_live_openai", True)))
+        self.chk_docx.setChecked(bool(self.cfg.get("generate_docx", True)))
+        self.cmb_lang.setCurrentText((self.cfg.get("postprocess_language") or "auto").lower())
+        self.cmb_quality.setCurrentText((self.cfg.get("whisper_quality") or "standard").lower())
+
+    def _save_ui_to_cfg(self):
+        self.cfg["enable_live_openai"] = bool(self.chk_live.isChecked())
+        self.cfg["generate_docx"] = bool(self.chk_docx.isChecked())
+        self.cfg["postprocess_language"] = self.cmb_lang.currentText()
+        self.cfg["whisper_quality"] = self.cmb_quality.currentText()
+        save_config(self.cfg)
+
+    def _on_cfg_changed(self):
+        self._save_ui_to_cfg()
+
+    def _tick_timer(self):
+        self._seconds += 1
+        hh = self._seconds // 3600
+        mm = (self._seconds % 3600) // 60
+        ss = self._seconds % 60
+        self.lbl_duration.setText(f"Durée: {hh:02d}:{mm:02d}:{ss:02d}")
+
+    def _append_live(self, line: str):
+        self.txt_live.appendPlainText(line)
+
+    def _append_debug(self, line: str):
+        self.txt_debug.appendPlainText(line)
+
+    def _set_status(self, msg: str):
+        self.statusBar().showMessage(msg, 5000)
+        self._append_debug(msg)
+
+    def _start_live_openai(self):
+        if self.live_thread:
+            return
+
+        self.live_thread = LiveOpenAIThread(cfg=self.cfg, recorder=self.recorder)
+        self.live_thread.live_line.connect(self._append_live)
+        self.live_thread.status.connect(self._set_status)
+        self.live_thread.start()
+
+    def _stop_live_openai(self):
+        if not self.live_thread:
+            return
+        try:
+            self.live_thread.stop()
+        except Exception:
+            pass
+        self.live_thread.quit()
+        self.live_thread.wait(2000)
+        self.live_thread = None
+
+
+    def _on_start(self):
+        try:
+            self.txt_live.clear()
+            self.txt_debug.clear()
+
+            # RecorderService manages its own session directory under output_root
+            self.recorder.start()
+            self.session_dir = self.recorder.session_dir
+
+            self._seconds = 0
+            self.timer.start(1000)
+
             self.btn_start.setEnabled(False)
+            self.btn_stop.setEnabled(True)
 
-            self._pp_thread = PostProcessThread(
-                cfg=self.cfg,
-                session_dir=Path(session_path),
-                language=language,
-                quality=quality,
-                parent=self,
-            )
+            self._set_status("Enregistrement démarré")
+            log_line("[UI] Start recording")
 
-            self._pp_thread.status.connect(self.live_log.appendPlainText)
-            self._pp_thread.done.connect(self._on_postprocess_done)
-            self._pp_thread.error.connect(self._on_postprocess_error)
-            self._pp_thread.start()
-        else:
-            self.status_label.setText(f"Terminé ! Fichiers en:\n{session_path}")
+            enable_live = bool(self.cfg.get("enable_live_openai", True))
+            if enable_live:
+                self._start_live_openai()
 
-    def _on_postprocess_done(self, msg: str):
-        self.status_label.setText(msg)
+        except Exception:
+            err = traceback.format_exc()
+            log_line("=== Start exception ===\n" + err)
+            QMessageBox.critical(self, "Erreur", err)
+
+    def _on_stop(self):
+        try:
+            self.btn_stop.setEnabled(False)
+            self.timer.stop()
+
+            self._stop_live_openai()
+
+            self.recorder.stop()
+            log_line("[UI] Stop recording")
+
+            self._set_status("Post-processing...")
+
+            if not self.session_dir:
+                self.session_dir = self.recorder.session_dir
+            if not self.session_dir:
+                raise RuntimeError("session_dir manquant (RecorderService)")
+
+            # Expose wav_path / mic_wav_path for PostProcessThread (compat)
+            ppaths = list(getattr(self.recorder.participants_track, "wav_paths", []) or [])
+            mpaths = list(getattr(self.recorder.my_track, "wav_paths", []) or [])
+
+            if not ppaths:
+                raise RuntimeError("Aucun fichier WAV participants généré.")
+            if not mpaths:
+                raise RuntimeError("Aucun fichier WAV micro généré.")
+
+            if len(ppaths) > 1:
+                log_line(f"[Recorder] ⚠ Plusieurs parties participants ({len(ppaths)}). Post-process prendra la première.")
+            if len(mpaths) > 1:
+                log_line(f"[Recorder] ⚠ Plusieurs parties micro ({len(mpaths)}). Post-process prendra la première.")
+
+            self.recorder.wav_path = Path(ppaths[0])
+            self.recorder.mic_wav_path = Path(mpaths[0])
+
+            self.pp_thread = PostProcessThread(cfg=self.cfg, recorder=self.recorder, session_dir=self.session_dir)
+            self.pp_thread.finished_ok.connect(self._on_postprocess_ok)
+            self.pp_thread.failed.connect(self._on_postprocess_fail)
+            self.pp_thread.start()
+
+        except Exception:
+            err = traceback.format_exc()
+            log_line("=== Stop exception ===\n" + err)
+            QMessageBox.critical(self, "Erreur", err)
+            self.btn_start.setEnabled(True)
+
+    def _on_postprocess_ok(self, transcript_path: str):
+        self._set_status(f"Terminé: {transcript_path}")
         self.btn_start.setEnabled(True)
+        QMessageBox.information(self, "Terminé", f"Transcription générée:\n{transcript_path}")
 
-    def _on_postprocess_error(self, err: str):
-        self.status_label.setText("Erreur post-process.")
+    def _on_postprocess_fail(self, err: str):
+        self._set_status("Post-process: erreur")
         self.btn_start.setEnabled(True)
         QMessageBox.critical(self, "Post-process error", err)
 
-    def on_error(self, error_msg: str):
-        self.timer.stop()
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        self.status_label.setText(f"Erreur: {error_msg}")
-        self._stop_live_translation()
-        QMessageBox.critical(self, "Erreur", error_msg)
+    def _on_setup(self):
+        # Lazy import to avoid circular
+        from ui.setup_window import SetupWindow
 
-    def update_duration(self):
-        self.duration_seconds += 1
-        h = self.duration_seconds // 3600
-        m = (self.duration_seconds % 3600) // 60
-        s = self.duration_seconds % 60
-        self.duration_label.setText(f"Durée: {h:02d}:{m:02d}:{s:02d}")
+        dlg = SetupWindow()
+        dlg.exec_()
+        self.cfg = load_config()
+        self._apply_cfg_to_ui()
 
-    def open_setup(self):
-        self._stop_live_translation()
+        # Rebuild recorder with updated device ids
+        po = self.cfg.get("participantsoutputdeviceid", None)
+        mi = self.cfg.get("microdeviceid", None)
+        if po is not None and mi is not None:
+            sessions_dir = Path(self.cfg.get("sessions_dir") or DEFAULT_SESSIONS_DIR)
+            sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        setup = SetupWindow()
-        result = setup.exec_() if hasattr(setup, "exec_") else setup.exec()
-        if result == 1:
-            self.cfg = load_config()
-            self._build_recorder()
-            self.recorder_thread.recorder = self.recorder
+            self.recorder = RecorderService(
+                participants_output_device_id=int(po),
+                mic_device_id=int(mi),
+                output_root=sessions_dir,
+            )
 
+            self.recorder.set_live_participants_queue(self.live_queue)
+            self.recorder.live_queue = self.live_queue
 
 def main():
     app = QApplication(sys.argv)
-    cfg = load_config()
-
-    has_part = ("participants_output_device_id" in cfg) or ("participantsoutputdeviceid" in cfg)
-    has_mic = ("micro_device_id" in cfg) or ("microdeviceid" in cfg)
-
-    if not has_part or not has_mic:
-        setup = SetupWindow()
-        result = setup.exec_() if hasattr(setup, "exec_") else setup.exec()
-        if result != 1:
-            sys.exit(0)
-        cfg = load_config()
-
-    w = MeetingWindow(cfg)
+    w = MainWindow()
+    w.resize(1100, 700)
     w.show()
     sys.exit(app.exec_())
 

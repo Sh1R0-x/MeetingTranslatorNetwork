@@ -33,27 +33,30 @@ except Exception:
 
 
 def _to_mono_float32_i16_pcm(raw_i16: np.ndarray, channels: int) -> np.ndarray:
+    """Convert PCM16 to mono float32 [-1, 1] - numpy 1.24.3 compatible"""
     if channels <= 1:
-        mono = raw_i16.astype(np.float32, copy=False)
+        mono = raw_i16.astype(np.float32)
     else:
         frames = raw_i16.size // channels
-        data = raw_i16[: frames * channels].reshape(frames, channels).astype(np.float32, copy=False)
+        data = raw_i16[: frames * channels].reshape(frames, channels).astype(np.float32)
         mono = data.mean(axis=1)
-    return (mono / 32768.0).astype(np.float32, copy=False)
+    return (mono / 32768.0).astype(np.float32)
 
 
 def _resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """Resample audio - numpy 1.24.3 compatible (no copy parameter)"""
     if src_sr == dst_sr or x.size < 2:
-        return x.astype(np.float32, copy=False)
+        return x.astype(np.float32)
     n = int(round(x.size * (dst_sr / float(src_sr))))
     n = max(n, 2)
     xp = np.arange(x.size, dtype=np.float32)
-    fp = x.astype(np.float32, copy=False)
+    fp = x.astype(np.float32)
     x_new = np.linspace(0, x.size - 1, num=n, dtype=np.float32)
-    return np.interp(x_new, xp, fp).astype(np.float32, copy=False)
+    return np.interp(x_new, xp, fp).astype(np.float32)
 
 
 def _float32_to_i16_bytes(x: np.ndarray) -> bytes:
+    """Convert float32 to PCM16 bytes"""
     x = np.clip(x, -1.0, 1.0)
     y = (x * 32767.0).astype(np.int16)
     return y.tobytes()

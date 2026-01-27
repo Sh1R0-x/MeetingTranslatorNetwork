@@ -1,0 +1,112 @@
+diff --git a/src/main.py b/src/main.py
+--- a/src/main.py
++++ b/src/main.py
+@@ -249,7 +249,33 @@
+         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
+ 
+         self.cfg = load_config()
+ 
+-        self.recorder = RecorderService(cfg=self.cfg)
++        # Live queue (participants) consumed by LiveOpenAIThread
++        self.live_queue = queue.Queue(maxsize=300)
++
++        # Device ids are saved by SetupWindow
++        po = self.cfg.get("participantsoutputdeviceid", None)
++        mi = self.cfg.get("microdeviceid", None)
++        if po is None or mi is None:
++            raise RuntimeError(
++                "Configuration audio manquante : ouvre Configuration et s?lectionne "
++                "la sortie Windows (participants) et le micro."
++            )
++
++        sessions_dir = Path(self.cfg.get("sessions_dir") or DEFAULT_SESSIONS_DIR)
++        sessions_dir.mkdir(parents=True, exist_ok=True)
++
++        self.recorder = RecorderService(
++            participants_output_device_id=int(po),
++            mic_device_id=int(mi),
++            output_root=sessions_dir,
++        )
++
++        # Plug live participants queue
++        self.recorder.set_live_participants_queue(self.live_queue)
++        self.recorder.live_queue = self.live_queue
+ 
+         self.session_dir = None
+ 
+         self.live_thread: LiveOpenAIThread | None = None
+         self.pp_thread: PostProcessThread | None = None
+@@ -350,12 +376,10 @@
+             self.txt_live.clear()
+             self.txt_debug.clear()
+ 
+-            sessions_dir = Path(self.cfg.get("sessions_dir") or DEFAULT_SESSIONS_DIR)
+-            sessions_dir.mkdir(parents=True, exist_ok=True)
+-
+-            self.session_dir = self.recorder.start_recording(sessions_dir=sessions_dir)
++            self.recorder.start()
++            self.session_dir = self.recorder.session_dir
+             self._seconds = 0
+             self.timer.start(1000)
+ 
+@@ -378,15 +402,44 @@
+ 
+             self._stop_live_openai()
+ 
+-            self.recorder.stop_recording()
++            self.recorder.stop()
+             log_line("[UI] Stop recording")
+ 
+             self._set_status("Post-processing...")
+ 
+             if not self.session_dir:
+-                raise RuntimeError("session_dir manquant")
++                self.session_dir = self.recorder.session_dir
++            if not self.session_dir:
++                raise RuntimeError("session_dir manquant (RecorderService)")
++
++            # Expose wav_path / mic_wav_path for PostProcessThread (compat)
++            ppaths = list(getattr(self.recorder.participants_track, "wav_paths", []) or [])
++            mpaths = list(getattr(self.recorder.my_track, "wav_paths", []) or [])
++
++            if not ppaths:
++                raise RuntimeError("Aucun fichier WAV participants g?n?r?.")
++            if not mpaths:
++                raise RuntimeError("Aucun fichier WAV micro g?n?r?.")
++
++            if len(ppaths) > 1:
++                log_line(f"[Recorder] ? Plusieurs parties participants ({len(ppaths)}). Post-process prendra la premi?re.")
++            if len(mpaths) > 1:
++                log_line(f"[Recorder] ? Plusieurs parties micro ({len(mpaths)}). Post-process prendra la premi?re.")
++
++            self.recorder.wav_path = Path(ppaths[0])
++            self.recorder.mic_wav_path = Path(mpaths[0])
+ 
+             self.pp_thread = PostProcessThread(cfg=self.cfg, recorder=self.recorder, session_dir=self.session_dir)
+             self.pp_thread.finished_ok.connect(self._on_postprocess_ok)
+             self.pp_thread.failed.connect(self._on_postprocess_fail)
+             self.pp_thread.start()
+@@ -406,12 +459,30 @@
+     def _on_setup(self):
+         # Lazy import to avoid circular
+         from ui.setup_window import SetupWindow
+ 
+-        dlg = SetupWindow(cfg=self.cfg, parent=self)
++        dlg = SetupWindow()
+         dlg.exec_()
+         self.cfg = load_config()
+         self._apply_cfg_to_ui()
++
++        # Rebuild recorder with updated device ids (only when not recording)
++        po = self.cfg.get("participantsoutputdeviceid", None)
++        mi = self.cfg.get("microdeviceid", None)
++        if po is not None and mi is not None:
++            sessions_dir = Path(self.cfg.get("sessions_dir") or DEFAULT_SESSIONS_DIR)
++            sessions_dir.mkdir(parents=True, exist_ok=True)
++            self.recorder = RecorderService(
++                participants_output_device_id=int(po),
++                mic_device_id=int(mi),
++                output_root=sessions_dir,
++            )
++            self.recorder.set_live_participants_queue(self.live_queue)
++            self.recorder.live_queue = self.live_queue
