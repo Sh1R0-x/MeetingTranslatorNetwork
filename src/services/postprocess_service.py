@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 @dataclass
@@ -69,6 +69,7 @@ def run_postprocess(
     hf_token: str,
     cfg: PostProcessConfig,
     mic_wav_path: Optional[Path] = None,
+    progress_cb: Optional[Callable[[str, float, str], None]] = None,
 ) -> str:
     """
     Lance la diarization/transcription et retourne le chemin du transcript.
@@ -85,5 +86,6 @@ def run_postprocess(
         session_dir=session_dir,
         hf_token=hf_token or "",
         cfg=cfg,
+        progress_cb=progress_cb,
     )
     return str(transcript_path)

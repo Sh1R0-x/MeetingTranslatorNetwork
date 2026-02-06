@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-import pyaudiowpatch as pyaudio
 import sounddevice as sd
+try:
+    import pyaudiowpatch as pyaudio
+except Exception:  # pragma: no cover - non-windows
+    pyaudio = None
 
 from audio.wasapi_loopback import get_loopback_for_output
 
@@ -204,6 +207,12 @@ class RecorderService:
     def start(self):
         if self._running:
             return
+
+        if pyaudio is None:
+            raise RuntimeError(
+                "Capture participants (WASAPI loopback) indisponible sur cette plateforme. "
+                "Utilise la version Windows pour l'enregistrement multi-pistes."
+            )
 
         now = datetime.now()
         date_dir = _date_folder_name(now)

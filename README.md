@@ -71,6 +71,23 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+## Build V1 (Windows / macOS)
+
+- Windows (EXE + installateur Inno Setup si installé):
+```powershell
+.\scripts\build_windows.ps1
+```
+
+- macOS (bundle `.app`, DMG si `create-dmg` est installé):
+```bash
+chmod +x scripts/build_macos.sh
+./scripts/build_macos.sh
+```
+
+- CI GitHub:
+  - Workflow: `.github/workflows/build-v1.yml`
+  - Déclenchement: tag `v*` ou manuel (`workflow_dispatch`)
+
 ## Lancement
 
 ```powershell
@@ -108,6 +125,9 @@ Les sessions sont écrites sous `recordings/`:
 - La séparation des voix en live reste une fonctionnalité intrinsèquement moins stable que le post-traitement complet.
 - Le mode recommandé pour des comptes rendus fiables: live lisible + identification voix en post-process.
 - Le post-traitement est volontairement séparé en sous-processus pour robustesse.
+- Les clés API ne sont pas mises en cache applicatif en clair:
+  - stockage OS sécurisé (`keyring` / keychain / credential manager)
+  - fallback Windows DPAPI chiffré uniquement si backend keyring indisponible
 
 ## Patch notes
 

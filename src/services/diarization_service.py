@@ -4,7 +4,7 @@ import math
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from faster_whisper import WhisperModel
@@ -66,6 +66,19 @@ def _write_wav_mono_i16(path: Path, sr: int, x: np.ndarray) -> None:
         wf.setsampwidth(2)
         wf.setframerate(int(sr))
         wf.writeframes(data.tobytes())
+
+
+def _emit_progress(progress_cb, stage: str, ratio: float, message: str) -> None:
+    if not callable(progress_cb):
+        return
+    try:
+        r = max(0.0, min(1.0, float(ratio)))
+    except Exception:
+        r = 0.0
+    try:
+        progress_cb(str(stage), r, str(message))
+    except Exception:
+        pass
 
 
 def _mix_tracks_for_diarization(
@@ -139,7 +152,12 @@ def _pick_whisper_device_and_compute(cfg) -> Tuple[str, str]:
     return "cpu", "float32" if quality in ("precise", "high", "best") else "int8"
 
 
-def _transcribe_whisper(model: WhisperModel, wav_path: Path, language: Optional[str]) -> List[Tuple[float, float, str]]:
+def _transcribe_whisper(
+    model: WhisperModel,
+    wav_path: Path,
+    language: Optional[str],
+    progress_cb: Optional[Callable[[float], None]] = None,
+) -> List[Tuple[float, float, str]]:
     # Conservative threading on Windows to avoid native crashes
     # If the installed faster-whisper doesn't accept these args, it will raise TypeError, so we keep defaults.
     segments: List[Tuple[float, float, str]] = []
@@ -153,16 +171,47 @@ def _transcribe_whisper(model: WhisperModel, wav_path: Path, language: Optional[
     except TypeError:
         gen, info = model.transcribe(str(wav_path), language=language)
 
+    duration = 0.0
+    try:
+        duration = float(getattr(info, "duration", 0.0) or 0.0)
+    except Exception:
+        duration = 0.0
+    if duration <= 0.0:
+        duration = max(0.0, _wav_duration_seconds(Path(wav_path)))
+
+    last_ratio = -1.0
     for s in gen:
         txt = (s.text or "").strip()
         if not txt:
             continue
-        segments.append((float(s.start), float(s.end), txt))
+        start_s = float(s.start)
+        end_s = float(s.end)
+        segments.append((start_s, end_s, txt))
+        if callable(progress_cb) and duration > 0:
+            ratio = max(0.0, min(1.0, end_s / duration))
+            if ratio >= 1.0 or (ratio - last_ratio) >= 0.01:
+                try:
+                    progress_cb(ratio)
+                except Exception:
+                    pass
+                last_ratio = ratio
+
+    if callable(progress_cb):
+        try:
+            progress_cb(1.0)
+        except Exception:
+            pass
     return segments
 
 
-def _transcribe_file(model: WhisperModel, wav_path: Path, speaker: str, language: Optional[str]) -> List[Segment]:
-    segments = _transcribe_whisper(model, wav_path, language=language)
+def _transcribe_file(
+    model: WhisperModel,
+    wav_path: Path,
+    speaker: str,
+    language: Optional[str],
+    progress_cb: Optional[Callable[[float], None]] = None,
+) -> List[Segment]:
+    segments = _transcribe_whisper(model, wav_path, language=language, progress_cb=progress_cb)
     return [Segment(start=s, end=e, speaker=speaker, text=t) for (s, e, t) in segments]
 
 
@@ -271,6 +320,7 @@ def diarize_session(
     session_dir: Path,
     hf_token: str,
     cfg,
+    progress_cb: Optional[Callable[[str, float, str], None]] = None,
 ) -> str:
     """
     Voice-based diarization (pyannote) when available, with fallback to 2-track labeling.
@@ -280,6 +330,7 @@ def diarize_session(
 
     wav_path = Path(wav_path)
     mic_path = Path(mic_wav_path) if mic_wav_path else None
+    _emit_progress(progress_cb, "prepare", 0.0, "Préparation des fichiers audio")
 
     model_name = _pick_whisper_model(cfg)
     language = _pick_language(cfg)
@@ -295,15 +346,19 @@ def diarize_session(
 
     device, compute_type = _pick_whisper_device_and_compute(cfg)
     model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    _emit_progress(progress_cb, "prepare", 1.0, "Préparation terminée")
 
     merged: List[Segment] = []
     hide_fallback_speakers = False
 
     if use_voice_diarization:
         try:
+            _emit_progress(progress_cb, "diarization", 0.05, "Préparation mix audio")
             mix_path = _mix_tracks_for_diarization(wav_path, mic_path, session_dir=session_dir, target_sr=16000)
+            _emit_progress(progress_cb, "diarization", 0.25, "Analyse des voix en cours")
             diar_segs = _run_pyannote_diarization(mix_path, diarization_model, hf_token, device=device)
             if not diar_segs and fallback_model:
+                _emit_progress(progress_cb, "diarization", 0.45, "Relance modèle de secours")
                 diar_segs = _run_pyannote_diarization(mix_path, fallback_model, hf_token, device=device)
 
             # Heuristic: if only 1 speaker is detected on a long file, retry with constraints
@@ -313,6 +368,7 @@ def diarize_session(
                 except Exception:
                     dur_s = 0.0
                 if dur_s >= 30.0 and _count_unique_labels(diar_segs) <= 1:
+                    _emit_progress(progress_cb, "diarization", 0.65, "Affinage des voix détectées")
                     diar_retry = _run_pyannote_diarization(
                         mix_path,
                         diarization_model,
@@ -323,8 +379,17 @@ def diarize_session(
                     )
                     if _count_unique_labels(diar_retry) > _count_unique_labels(diar_segs):
                         diar_segs = diar_retry
+            _emit_progress(progress_cb, "diarization", 1.0, "Analyse des voix terminée")
             if diar_segs and _count_unique_labels(diar_segs) > 1:
-                transcript_segs = _transcribe_whisper(model, mix_path, language=language)
+                def _voice_transcribe_progress(r: float) -> None:
+                    _emit_progress(progress_cb, "transcription", r, "Transcription du mix audio")
+
+                transcript_segs = _transcribe_whisper(
+                    model,
+                    mix_path,
+                    language=language,
+                    progress_cb=_voice_transcribe_progress,
+                )
                 merged = _assign_speakers_to_transcript(transcript_segs, diar_segs)
             else:
                 merged = []
@@ -339,18 +404,47 @@ def diarize_session(
 
     if not merged:
         spk_part = "" if hide_fallback_speakers else "SPEAKER_00"
-        participants = _transcribe_file(model, wav_path, speaker=spk_part, language=language)
+        dur_part = max(0.0, _wav_duration_seconds(wav_path))
+        dur_mic = max(0.0, _wav_duration_seconds(mic_path)) if mic_path and mic_path.exists() else 0.0
+        total_dur = max(0.001, dur_part + dur_mic)
+        part_weight = dur_part / total_dur if total_dur > 0 else 0.5
+
+        def _part_transcribe_progress(r: float) -> None:
+            _emit_progress(progress_cb, "transcription", r * part_weight, "Transcription piste participants")
+
+        participants = _transcribe_file(
+            model,
+            wav_path,
+            speaker=spk_part,
+            language=language,
+            progress_cb=_part_transcribe_progress,
+        )
         mic_segs: List[Segment] = []
         if mic_path and mic_path.exists():
             spk_mic = "" if hide_fallback_speakers else "SPEAKER_01"
-            mic_segs = _transcribe_file(model, mic_path, speaker=spk_mic, language=language)
+
+            def _mic_transcribe_progress(r: float) -> None:
+                base = part_weight
+                mic_weight = max(0.0, 1.0 - part_weight)
+                _emit_progress(progress_cb, "transcription", base + (r * mic_weight), "Transcription piste micro")
+
+            mic_segs = _transcribe_file(
+                model,
+                mic_path,
+                speaker=spk_mic,
+                language=language,
+                progress_cb=_mic_transcribe_progress,
+            )
         merged = _merge_segments(participants, mic_segs)
+    _emit_progress(progress_cb, "transcription", 1.0, "Transcription terminée")
 
     out_mix = session_dir / "transcript-speakers.mix.txt"
     out_fr = session_dir / "transcript_speakers_fr.txt"
 
     text = _format_segments(merged)
+    _emit_progress(progress_cb, "write", 0.5, "Écriture des fichiers transcription")
     out_mix.write_text(text, encoding="utf-8")
     out_fr.write_text(text, encoding="utf-8")
+    _emit_progress(progress_cb, "write", 1.0, "Fichiers transcription écrits")
 
     return str(out_mix)

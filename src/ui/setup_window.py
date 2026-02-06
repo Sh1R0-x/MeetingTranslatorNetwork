@@ -5,8 +5,11 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pyaudiowpatch as pyaudio
 import sounddevice as sd
+try:
+    import pyaudiowpatch as pyaudio
+except Exception:  # pragma: no cover - non-windows
+    pyaudio = None
 from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -179,6 +182,8 @@ class LevelMeterLoopback:
         self.channels = 2
 
     def start_from_output(self, outputdeviceindex: int):
+        if pyaudio is None:
+            raise RuntimeError("Test sortie audio indisponible sur cette plateforme.")
         self.stop()
         lb = get_loopback_for_output(int(outputdeviceindex))
         if not lb:
@@ -754,6 +759,13 @@ class SetupWindow(QDialog):
         outs = list_wasapi_output_devices()
         for d in outs:
             self.cbparticipants.addItem(f"{d['index']} | {d['name']}", int(d["index"]))
+        if self.cbparticipants.count() == 0:
+            self.cbparticipants.addItem("Non disponible sur cette plateforme", -1)
+            self.cbparticipants.setEnabled(False)
+            self.btntestparticipants.setEnabled(False)
+        else:
+            self.cbparticipants.setEnabled(True)
+            self.btntestparticipants.setEnabled(True)
 
         inputs = list_input_devices_with_api()
         for devid, label in inputs:
@@ -858,8 +870,13 @@ class SetupWindow(QDialog):
         QMessageBox.critical(self, "Erreur modèles voix", msg)
 
     def save(self):
-        self.cfg["participantsoutputdeviceid"] = int(self.cbparticipants.currentData())
-        self.cfg["microdeviceid"] = int(self.cbmicro.currentData())
+        part_data = self.cbparticipants.currentData()
+        mic_data = self.cbmicro.currentData()
+        self.cfg["participantsoutputdeviceid"] = int(part_data) if part_data is not None else -1
+        if mic_data is None:
+            QMessageBox.warning(self, "Configuration", "Sélectionne une entrée audio (micro).")
+            return
+        self.cfg["microdeviceid"] = int(mic_data)
 
         self.cfg["enable_live"] = bool(self.chk_enable_live.isChecked())
         self.cfg["live_engine"] = str(self.cb_live_engine.currentData())

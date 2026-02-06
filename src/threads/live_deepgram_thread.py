@@ -332,7 +332,11 @@ class LiveDeepgramThread(QThread):
 
         self._start_translation_worker()
 
-        def _build_url(minimal: bool = False) -> str:
+        def _build_url(mode: str = "full") -> str:
+            # mode:
+            # - full: all configured params
+            # - no_utterance_end: keep quality params but drop utterance_end_ms
+            # - minimal: only mandatory params
             params = [
                 f"model={self.model}",
                 "encoding=linear16",
@@ -341,7 +345,7 @@ class LiveDeepgramThread(QThread):
             ]
             if self.source_language and self.source_language != "auto":
                 params.append(f"language={self.source_language}")
-            if not minimal:
+            if mode != "minimal":
                 if self.smart_format:
                     params.append("smart_format=true")
                 if self.punctuate:
@@ -350,7 +354,7 @@ class LiveDeepgramThread(QThread):
                     params.append("interim_results=true")
                 if self.vad_events:
                     params.append("vad_events=true")
-                if self.utterance_end_ms >= 1000:
+                if mode != "no_utterance_end" and self.utterance_end_ms >= 1000:
                     params.append(f"utterance_end_ms={self.utterance_end_ms}")
                 if self.endpointing:
                     params.append(f"endpointing={self.endpointing}")
@@ -359,8 +363,8 @@ class LiveDeepgramThread(QThread):
             query_string = "&".join(params)
             return f"wss://api.deepgram.com/v1/listen?{query_string}"
 
-        # Construire l'URL WebSocket Deepgram (full puis fallback minimal si HTTP 400)
-        url = _build_url(minimal=False)
+        # Build primary URL; on HTTP 400 we progressively degrade parameters.
+        url = _build_url(mode="full")
 
         if self._debug:
             log_line(f"[Deepgram] Connect URL: {url}")
@@ -377,16 +381,29 @@ class LiveDeepgramThread(QThread):
                         self.status.emit(f"Live: Deepgram connecté ({self.model})")
                         self._run_websocket_sync(ws)
                 except Exception as e:
-                    # Retry with minimal params if server rejects the query
+                    # Retry with progressive fallback if server rejects the query.
                     try:
                         from websockets.exceptions import InvalidStatus
                         if isinstance(e, InvalidStatus) and getattr(e, "response", None) and e.response.status_code == 400:
-                            url_min = _build_url(minimal=True)
+                            # Step 1: keep formatting/quality params, drop utterance_end_ms only.
+                            url_no_ue = _build_url(mode="no_utterance_end")
                             if self._debug:
-                                log_line(f"[Deepgram] Retry with minimal params: {url_min}")
-                            with ws_client.connect(url_min, additional_headers=headers) as ws:
-                                self.status.emit(f"Live: Deepgram connecté ({self.model})")
-                                self._run_websocket_sync(ws)
+                                log_line(f"[Deepgram] Retry without utterance_end_ms: {url_no_ue}")
+                            try:
+                                with ws_client.connect(url_no_ue, additional_headers=headers) as ws:
+                                    self.status.emit(f"Live: Deepgram connecté ({self.model})")
+                                    self._run_websocket_sync(ws)
+                            except Exception as e2:
+                                # Step 2: last resort minimal params.
+                                if isinstance(e2, InvalidStatus) and getattr(e2, "response", None) and e2.response.status_code == 400:
+                                    url_min = _build_url(mode="minimal")
+                                    if self._debug:
+                                        log_line(f"[Deepgram] Retry with minimal params: {url_min}")
+                                    with ws_client.connect(url_min, additional_headers=headers) as ws:
+                                        self.status.emit(f"Live: Deepgram connecté ({self.model})")
+                                        self._run_websocket_sync(ws)
+                                else:
+                                    raise
                         else:
                             raise
                     except Exception:

@@ -1,9 +1,15 @@
 from __future__ import annotations
-import pyaudiowpatch as pyaudio
+
+try:
+    import pyaudiowpatch as pyaudio
+except Exception:  # pragma: no cover - non-windows environments
+    pyaudio = None
 
 
 def list_wasapi_output_devices():
     """Liste des sorties WASAPI (non-loopback)."""
+    if pyaudio is None:
+        return []
     out = []
     with pyaudio.PyAudio() as p:
         wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
@@ -26,6 +32,8 @@ def get_loopback_for_output(output_index: int):
     PyAudioWPatch duplique les loopback devices en tant que périphériques d'entrée (souvent suffixés [Loopback]). [web:36]
     Le matching par nom est la méthode utilisée dans leurs exemples. [web:417]
     """
+    if pyaudio is None:
+        return None
     with pyaudio.PyAudio() as p:
         out_dev = p.get_device_info_by_index(output_index)
 

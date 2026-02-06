@@ -1210,6 +1210,9 @@ class MainWindow(QMainWindow):
         self.pp_progress_timer = QTimer(self)
         self.pp_progress_timer.setInterval(500)
         self.pp_progress_timer.timeout.connect(self._poll_postprocess_progress)
+        self._pp_last_payload = None
+        self._pp_last_payload_ts = 0.0
+        self._pp_display_percent = 0
         self.price_timer = QTimer(self)
         self.price_timer.setInterval(30000)
         self.price_timer.timeout.connect(self._update_price_estimate)
@@ -2608,6 +2611,9 @@ class MainWindow(QMainWindow):
         self.lbl_progress.setVisible(True)
         self.lbl_progress.setText("Compte rendu en cours...")
         self.btn_cancel_pp.setVisible(True)
+        self._pp_last_payload = None
+        self._pp_last_payload_ts = time.time()
+        self._pp_display_percent = 0
         self.pp_progress_timer.start()
 
     def _stop_postprocess_progress(self):
@@ -2615,6 +2621,9 @@ class MainWindow(QMainWindow):
         self.pp_progress.setVisible(False)
         self.lbl_progress.setVisible(False)
         self.btn_cancel_pp.setVisible(False)
+        self._pp_last_payload = None
+        self._pp_last_payload_ts = 0.0
+        self._pp_display_percent = 0
 
     def _poll_postprocess_progress(self):
         if not self.session_dir:
@@ -2624,13 +2633,53 @@ class MainWindow(QMainWindow):
             return
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
-            percent = int(data.get("percent", 0))
-            self.pp_progress.setValue(max(0, min(100, percent)))
+            percent = max(0, min(100, int(data.get("percent", 0))))
             msg = data.get("message") or ""
             stage = data.get("stage") or ""
+            now = time.time()
+            payload = (percent, stage, msg)
+            if payload != self._pp_last_payload:
+                self._pp_last_payload = payload
+                self._pp_last_payload_ts = now
+                self._pp_display_percent = max(self._pp_display_percent, percent)
+            else:
+                # Fallback visual smoothing when backend progress stays static for a while.
+                age = max(0.0, now - float(self._pp_last_payload_ts or now))
+                if age >= 3.0 and percent < 99:
+                    if stage == "start":
+                        cap = 25
+                    elif stage == "transcription":
+                        cap = 88
+                    elif stage == "fusion":
+                        cap = 94
+                    elif stage == "docx":
+                        cap = 98
+                    else:
+                        cap = 90
+                    step = int((age - 3.0) // 2.0) + 1
+                    synthetic = min(cap, percent + step)
+                    self._pp_display_percent = max(self._pp_display_percent, synthetic)
+
+            shown_percent = max(percent, self._pp_display_percent)
+            self.pp_progress.setValue(max(0, min(100, shown_percent)))
             if msg or stage:
-                stage_txt = f"{stage} · " if stage else ""
-                self.lbl_progress.setText(f"{stage_txt}{msg} ({percent}%)")
+                stage_map = {
+                    "start": "",
+                    "prepare": "Préparation",
+                    "diarization": "Voix",
+                    "transcription": "Transcription",
+                    "write": "Finalisation",
+                    "fusion": "Fusion",
+                    "docx": "DOCX",
+                    "done": "Terminé",
+                    "error": "Erreur",
+                }
+                stage_label = stage_map.get(str(stage).strip().lower(), "")
+                stage_txt = f"{stage_label} · " if stage_label else ""
+                if shown_percent > percent and percent < 100:
+                    self.lbl_progress.setText(f"{stage_txt}{msg} · En cours... ({shown_percent}%)")
+                else:
+                    self.lbl_progress.setText(f"{stage_txt}{msg} ({shown_percent}%)")
         except Exception:
             pass
 
