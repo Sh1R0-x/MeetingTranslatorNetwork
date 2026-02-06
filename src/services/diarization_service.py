@@ -1,260 +1,268 @@
 from __future__ import annotations
 
-import re
+import math
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
 from faster_whisper import WhisperModel
-
-
-# --- HuggingFace Hub compatibility shim ---
-# Certaines versions de pyannote.audio appellent hf_hub_download(..., use_auth_token=...)
-# alors que certaines versions récentes de huggingface_hub n'acceptent plus ce paramètre.
-# On patch hf_hub_download pour rester compatible, sans toucher aux dépendances.
-
-def _patch_hf_hub_download_compat() -> None:
-    try:
-        import huggingface_hub
-        from huggingface_hub import hf_hub_download as _orig
-
-        # Déjà patché ?
-        if getattr(huggingface_hub.hf_hub_download, "__mt_patched__", False):
-            return
-
-        def _wrapped_hf_hub_download(*args, **kwargs):
-            # Remap use_auth_token -> token (nouvelle API)
-            if "use_auth_token" in kwargs and "token" not in kwargs:
-                kwargs["token"] = kwargs.pop("use_auth_token")
-            else:
-                kwargs.pop("use_auth_token", None)
-            return _orig(*args, **kwargs)
-
-        _wrapped_hf_hub_download.__mt_patched__ = True  # type: ignore[attr-defined]
-        huggingface_hub.hf_hub_download = _wrapped_hf_hub_download  # type: ignore[assignment]
-    except Exception:
-        # Si le patch échoue, on ne bloque pas (on tentera quand même la diarization).
-        return
+from scipy.signal import resample_poly
 
 
 @dataclass
-class DiarizationConfig:
-    diarization_model: str = "pyannote/speaker-diarization-3.1"
-    fallback_model: str = "pyannote/speaker-diarization@2.1"
-    device: str = "auto"
-    whisper_model: str = "small"
-    whisper_compute_type: str = "int8"
-    whisper_beam_size: int = 5
-    whisper_vad_filter: bool = True
+class Segment:
+    start: float
+    end: float
+    speaker: str
+    text: str
 
 
-def resolve_device(device: str) -> str:
-    device = (device or "auto").lower()
-    if device == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    return device
+def _wav_duration_seconds(path: Path) -> float:
+    try:
+        with wave.open(str(path), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate()
+            return float(frames) / float(rate) if rate else 0.0
+    except Exception:
+        return 0.0
 
 
-def resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
-    """Resample with numpy 1.24.3 compatibility (no copy parameter)."""
-    if src_sr == dst_sr or x.size < 2:
+def _read_wav_mono_float32(path: Path) -> Tuple[int, np.ndarray]:
+    try:
+        with wave.open(str(path), "rb") as wf:
+            channels = int(wf.getnchannels())
+            sr = int(wf.getframerate())
+            frames = int(wf.getnframes())
+            raw = wf.readframes(frames)
+        data = np.frombuffer(raw, dtype=np.int16)
+        if channels > 1:
+            data = data.reshape(-1, channels).mean(axis=1)
+        return sr, (data.astype(np.float32) / 32768.0)
+    except Exception:
+        return 0, np.zeros((0,), dtype=np.float32)
+
+
+def _resample_mono(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    if src_sr <= 0 or dst_sr <= 0 or x.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+    if src_sr == dst_sr:
         return x.astype(np.float32)
-
-    n = int(round(x.size * dst_sr / float(src_sr)))
-    n = max(n, 2)
-
-    xp = np.arange(x.size, dtype=np.float32)
-    fp = x.astype(np.float32)
-    xnew = np.linspace(0, x.size - 1, num=n, dtype=np.float32)
-
-    return np.interp(xnew, xp, fp)
+    g = math.gcd(int(src_sr), int(dst_sr))
+    up = int(dst_sr // g)
+    down = int(src_sr // g)
+    y = resample_poly(x.astype(np.float32), up=up, down=down)
+    return y.astype(np.float32)
 
 
-def load_wav_as_mono_float32(wav_path: Path) -> Tuple[np.ndarray, int]:
-    """Charge WAV PCM 16-bit via wave. Retourne mono float32 [-1,1]."""
-    with wave.open(str(wav_path), "rb") as wf:
-        sr = wf.getframerate()
-        n_channels = wf.getnchannels()
-        sampwidth = wf.getsampwidth()
-        if sampwidth != 2:
-            raise RuntimeError(f"WAV sampwidth != 16-bit (got {sampwidth*8} bits)")
-
-        frames = wf.readframes(wf.getnframes())
-        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-
-        if n_channels > 1:
-            audio = audio.reshape(-1, n_channels).mean(axis=1)
-
-        return audio.astype(np.float32), int(sr)
+def _write_wav_mono_i16(path: Path, sr: int, x: np.ndarray) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    y = np.clip(x, -1.0, 1.0)
+    data = (y * 32767.0).astype(np.int16)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sr))
+        wf.writeframes(data.tobytes())
 
 
-def _load_pyannote_pipeline(model_id: str, hf_token: str = ""):
-    """Charge le pipeline pyannote - Compatible toutes versions."""
-    from pyannote.audio import Pipeline
+def _mix_tracks_for_diarization(
+    participants_path: Path,
+    mic_path: Optional[Path],
+    session_dir: Path,
+    target_sr: int = 16000,
+) -> Path:
+    session_dir = Path(session_dir)
+    out_path = session_dir / "mix_for_diarization.wav"
 
-    _patch_hf_hub_download_compat()
+    sr_p, x_p = _read_wav_mono_float32(Path(participants_path))
+    x_p = _resample_mono(x_p, sr_p, target_sr) if sr_p else np.zeros((0,), dtype=np.float32)
 
-    # ✅ Méthode universelle : login d'abord, puis load
-    if hf_token:
-        try:
-            from huggingface_hub import login
-            login(token=hf_token, add_to_git_credential=False)
-        except Exception as e:
-            print(f"Warning: huggingface_hub.login() failed: {e}")
+    xs = [x_p]
 
-    # Charger le pipeline (sans passer de token, car déjà logged in)
+    if mic_path and Path(mic_path).exists():
+        sr_m, x_m = _read_wav_mono_float32(Path(mic_path))
+        x_m = _resample_mono(x_m, sr_m, target_sr) if sr_m else np.zeros((0,), dtype=np.float32)
+        xs.append(x_m)
+
+    max_len = max((x.size for x in xs), default=0)
+    if max_len <= 0:
+        _write_wav_mono_i16(out_path, target_sr, np.zeros((0,), dtype=np.float32))
+        return out_path
+
+    mix = np.zeros((max_len,), dtype=np.float32)
+    for x in xs:
+        if x.size < max_len:
+            pad = np.zeros((max_len - x.size,), dtype=np.float32)
+            x = np.concatenate([x, pad])
+        mix += x
+
+    mix /= max(1.0, float(len(xs)))
+    _write_wav_mono_i16(out_path, target_sr, mix)
+    return out_path
+
+
+def _pick_whisper_model(cfg) -> str:
+    # Keep it simple & stable
+    q = str(getattr(cfg, "quality", "") or "").lower()
+    if q in ("precise", "high", "best"):
+        return "medium"
+    return "small"
+
+
+def _pick_language(cfg) -> Optional[str]:
+    lang = str(getattr(cfg, "language", "") or "").strip().lower()
+    if not lang or lang == "auto":
+        return None
+    return lang
+
+
+def _pick_whisper_device_and_compute(cfg) -> Tuple[str, str]:
+    quality = str(getattr(cfg, "quality", "") or "").lower()
+    device_pref = str(getattr(cfg, "device", "") or "auto").lower()
+
     try:
-        return Pipeline.from_pretrained(model_id)
-    except Exception as e:
-        error_msg = (
-            f"❌ Impossible de charger le modèle {model_id}\n\n"
-            f"Erreur: {str(e)[:200]}\n\n"
-            f"Vérifiez:\n"
-            f"1. HuggingFace token valide dans Setup\n"
-            f"2. Accepté les conditions sur: https://huggingface.co/{model_id}\n"
-            f"3. Connexion internet active\n"
-            f"4. Redémarrez l'application après avoir configuré le token\n"
+        import torch
+    except Exception:
+        torch = None
+
+    has_cuda = bool(torch and torch.cuda.is_available())
+
+    if device_pref == "cuda" and has_cuda:
+        return "cuda", "float16"
+    if device_pref == "cpu":
+        return "cpu", "float32" if quality in ("precise", "high", "best") else "int8"
+    if has_cuda:
+        return "cuda", "float16"
+    return "cpu", "float32" if quality in ("precise", "high", "best") else "int8"
+
+
+def _transcribe_whisper(model: WhisperModel, wav_path: Path, language: Optional[str]) -> List[Tuple[float, float, str]]:
+    # Conservative threading on Windows to avoid native crashes
+    # If the installed faster-whisper doesn't accept these args, it will raise TypeError, so we keep defaults.
+    segments: List[Tuple[float, float, str]] = []
+    try:
+        gen, info = model.transcribe(
+            str(wav_path),
+            language=language,
+            vad_filter=True,
+            beam_size=5,
         )
-        raise RuntimeError(error_msg)
+    except TypeError:
+        gen, info = model.transcribe(str(wav_path), language=language)
 
-
-def diarize_participants_wav(
-    wav_path: Path,
-    hf_token: str,
-    cfg: DiarizationConfig,
-) -> List[Tuple[float, float, str]]:
-    """Speaker-diarization sur piste participants."""
-    mono, sr = load_wav_as_mono_float32(wav_path)
-    target_sr = 16000
-    mono_16k = resample_linear(mono, sr, target_sr)
-
-    pipeline = None
-    try:
-        pipeline = _load_pyannote_pipeline(cfg.diarization_model, hf_token)
-    except Exception:
-        try:
-            pipeline = _load_pyannote_pipeline(cfg.fallback_model, hf_token)
-        except Exception:
-            pipeline = None
-
-    # Si diarization indisponible (token absent / modèle inaccessible / incompat deps),
-    # on ne casse PAS le post-process : on retourne un seul speaker sur toute la piste.
-    if pipeline is None:
-        duration = float(mono_16k.size) / float(target_sr) if target_sr > 0 else 0.0
-        return [(0.0, max(duration, 0.0), "SPEAKER_00")]
-
-    device = resolve_device(cfg.device)
-    try:
-        pipeline.to(torch.device(device))
-    except Exception:
-        pass
-
-    waveform = torch.from_numpy(mono_16k).unsqueeze(0)
-    diar_out = pipeline({"waveform": waveform, "sample_rate": target_sr})
-
-    turns: List[Tuple[float, float, str]] = []
-    for turn, _, speaker in diar_out.itertracks(yield_label=True):
-        turns.append((float(turn.start), float(turn.end), str(speaker)))
-
-    if not turns:
-        duration = float(mono_16k.size) / float(target_sr) if target_sr > 0 else 0.0
-        return [(0.0, max(duration, 0.0), "SPEAKER_00")]
-
-    return turns
-
-
-def transcribe_with_whisper(
-    wav_path: Path,
-    cfg: DiarizationConfig,
-    language: str = "auto",
-) -> List[Dict]:
-    """Transcription faster-whisper. Retourne segments = [{'start','end','text'}]."""
-    device = resolve_device(cfg.device)
-
-    model = WhisperModel(
-        cfg.whisper_model,
-        device=device,
-        compute_type=cfg.whisper_compute_type,
-    )
-
-    kwargs = dict(
-        beam_size=cfg.whisper_beam_size,
-        vad_filter=cfg.whisper_vad_filter,
-    )
-    if language and language != "auto":
-        kwargs["language"] = language
-
-    segments, _ = model.transcribe(str(wav_path), **kwargs)
-
-    out = []
-    for s in segments:
-        out.append({"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()})
-    return out
-
-
-def _clean_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    return text
-
-
-def diarize_and_transcribe_participants(
-    wav_path: Path,
-    hf_token: str,
-    cfg: DiarizationConfig,
-    language: str = "auto",
-) -> List[Dict]:
-    """Retourne une liste de segments alignés speaker+text."""
-    turns = diarize_participants_wav(wav_path, hf_token=hf_token, cfg=cfg)
-    segments = transcribe_with_whisper(wav_path, cfg=cfg, language=language)
-
-    # Simple alignment by overlap:
-    out: List[Dict] = []
-    for seg in segments:
-        s0, s1 = float(seg["start"]), float(seg["end"])
-        txt = _clean_text(seg["text"])
-
+    for s in gen:
+        txt = (s.text or "").strip()
         if not txt:
             continue
-
-        # pick speaker with max overlap
-        best_spk = "SPEAKER_00"
-        best_ov = 0.0
-        for t0, t1, spk in turns:
-            ov = max(0.0, min(s1, t1) - max(s0, t0))
-            if ov > best_ov:
-                best_ov = ov
-                best_spk = spk
-
-        out.append(
-            {
-                "start": s0,
-                "end": s1,
-                "speaker": best_spk,
-                "text": txt,
-            }
-        )
-
-    return out
+        segments.append((float(s.start), float(s.end), txt))
+    return segments
 
 
-def _fmt_ts(seconds: float) -> str:
-    seconds = max(0.0, float(seconds))
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+def _transcribe_file(model: WhisperModel, wav_path: Path, speaker: str, language: Optional[str]) -> List[Segment]:
+    segments = _transcribe_whisper(model, wav_path, language=language)
+    return [Segment(start=s, end=e, speaker=speaker, text=t) for (s, e, t) in segments]
 
 
-def _write_transcript_speakers_txt(path: Path, segs: List[Dict]) -> None:
+def _merge_segments(a: List[Segment], b: List[Segment]) -> List[Segment]:
+    all_segs = list(a) + list(b)
+    all_segs.sort(key=lambda x: (x.start, x.end))
+    return all_segs
+
+
+def _format_segments(segs: List[Segment]) -> str:
+    def fmt_ts(t: float) -> str:
+        if t < 0:
+            t = 0.0
+        h = int(t // 3600)
+        m = int((t % 3600) // 60)
+        s = int(t % 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
     lines = []
     for s in segs:
-        lines.append(
-            f"{_fmt_ts(s['start'])} - {_fmt_ts(s['end'])} {s['speaker']} {s['text']}"
-        )
-    path.write_text("\n".join(lines), encoding="utf-8")
+        if s.speaker:
+            lines.append(f"[{fmt_ts(s.start)} - {fmt_ts(s.end)}] {s.speaker}: {s.text}")
+        else:
+            lines.append(f"[{fmt_ts(s.start)} - {fmt_ts(s.end)}] {s.text}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _run_pyannote_diarization(
+    wav_path: Path,
+    model_name: str,
+    hf_token: str,
+    device: str,
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+) -> List[Tuple[float, float, str]]:
+    from pyannote.audio import Pipeline
+
+    pipeline = Pipeline.from_pretrained(model_name, use_auth_token=hf_token)
+
+    if device == "cuda":
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                pipeline = pipeline.to(torch.device("cuda"))
+        except Exception:
+            pass
+
+    kwargs = {}
+    if isinstance(min_speakers, int) and min_speakers > 0:
+        kwargs["min_speakers"] = int(min_speakers)
+    if isinstance(max_speakers, int) and max_speakers > 0:
+        kwargs["max_speakers"] = int(max_speakers)
+    try:
+        diar = pipeline(str(wav_path), **kwargs) if kwargs else pipeline(str(wav_path))
+    except TypeError:
+        diar = pipeline(str(wav_path))
+    segments: List[Tuple[float, float, str]] = []
+    for seg, _track, label in diar.itertracks(yield_label=True):
+        segments.append((float(seg.start), float(seg.end), str(label)))
+    return segments
+
+
+def _count_unique_labels(diar_segs: List[Tuple[float, float, str]]) -> int:
+    labels = {lbl for _s, _e, lbl in diar_segs if lbl is not None}
+    return len(labels)
+
+
+def _normalize_speaker_labels(diar_segs: List[Tuple[float, float, str]]) -> Dict[str, str]:
+    order: List[str] = []
+    for _s, _e, lbl in diar_segs:
+        if lbl not in order:
+            order.append(lbl)
+    return {lbl: f"SPEAKER_{i:02d}" for i, lbl in enumerate(order)}
+
+
+def _assign_speakers_to_transcript(
+    transcript_segs: List[Tuple[float, float, str]],
+    diar_segs: List[Tuple[float, float, str]],
+) -> List[Segment]:
+    if not diar_segs:
+        return [Segment(start=s, end=e, speaker="SPEAKER_00", text=t) for (s, e, t) in transcript_segs]
+
+    label_map = _normalize_speaker_labels(diar_segs)
+
+    out: List[Segment] = []
+    for s, e, text in transcript_segs:
+        best_lbl = None
+        best_ov = 0.0
+        for ds, de, lbl in diar_segs:
+            ov = min(e, de) - max(s, ds)
+            if ov > best_ov:
+                best_ov = ov
+                best_lbl = lbl
+        if best_lbl is None:
+            speaker = "SPEAKER_??"
+        else:
+            speaker = label_map.get(best_lbl, "SPEAKER_??")
+        out.append(Segment(start=s, end=e, speaker=speaker, text=text))
+    return out
 
 
 def diarize_session(
@@ -265,38 +273,84 @@ def diarize_session(
     cfg,
 ) -> str:
     """
-    Pipeline de post-process:
-    - diarize+transcribe piste participants
-    - (optionnel) prendre micro en compte plus tard
-    - export transcript-speakers.mix.txt
+    Voice-based diarization (pyannote) when available, with fallback to 2-track labeling.
     """
     session_dir = Path(session_dir)
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    # PostProcessConfig -> DiarizationConfig mapping (simple)
-    dcfg = DiarizationConfig()
+    wav_path = Path(wav_path)
+    mic_path = Path(mic_wav_path) if mic_wav_path else None
 
-    language = getattr(cfg, "language", "auto") or "auto"
-    quality = getattr(cfg, "quality", "standard") or "standard"
+    model_name = _pick_whisper_model(cfg)
+    language = _pick_language(cfg)
 
-    # switch whisper models based on quality
-    if quality == "precise":
-        dcfg.whisper_model = "medium"
-        dcfg.whisper_compute_type = "int8"
-        dcfg.whisper_beam_size = 5
+    # Prefer voice diarization if HF token is present and pyannote is available
+    diar_mode = str(getattr(cfg, "diarization_mode", "") or "").lower()
+    if diar_mode not in ("voice", "source"):
+        diar_mode = "voice"
+    enable_diarization = bool(getattr(cfg, "enable_diarization", True))
+    use_voice_diarization = diar_mode == "voice" and bool(hf_token) and enable_diarization
+    diarization_model = str(getattr(cfg, "diarization_model", "") or "pyannote/speaker-diarization-3.1")
+    fallback_model = str(getattr(cfg, "fallback_model", "") or "pyannote/speaker-diarization")
+
+    device, compute_type = _pick_whisper_device_and_compute(cfg)
+    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+
+    merged: List[Segment] = []
+    hide_fallback_speakers = False
+
+    if use_voice_diarization:
+        try:
+            mix_path = _mix_tracks_for_diarization(wav_path, mic_path, session_dir=session_dir, target_sr=16000)
+            diar_segs = _run_pyannote_diarization(mix_path, diarization_model, hf_token, device=device)
+            if not diar_segs and fallback_model:
+                diar_segs = _run_pyannote_diarization(mix_path, fallback_model, hf_token, device=device)
+
+            # Heuristic: if only 1 speaker is detected on a long file, retry with constraints
+            if diar_segs:
+                try:
+                    dur_s = _wav_duration_seconds(mix_path)
+                except Exception:
+                    dur_s = 0.0
+                if dur_s >= 30.0 and _count_unique_labels(diar_segs) <= 1:
+                    diar_retry = _run_pyannote_diarization(
+                        mix_path,
+                        diarization_model,
+                        hf_token,
+                        device=device,
+                        min_speakers=2,
+                        max_speakers=6,
+                    )
+                    if _count_unique_labels(diar_retry) > _count_unique_labels(diar_segs):
+                        diar_segs = diar_retry
+            if diar_segs and _count_unique_labels(diar_segs) > 1:
+                transcript_segs = _transcribe_whisper(model, mix_path, language=language)
+                merged = _assign_speakers_to_transcript(transcript_segs, diar_segs)
+            else:
+                merged = []
+                hide_fallback_speakers = True
+        except Exception:
+            merged = []
+            hide_fallback_speakers = True
     else:
-        dcfg.whisper_model = "small"
-        dcfg.whisper_compute_type = "int8"
-        dcfg.whisper_beam_size = 5
+        # Voice diarization requested but unavailable (no token) -> hide labels in fallback
+        if diar_mode == "voice":
+            hide_fallback_speakers = True
 
-    segs_p = diarize_and_transcribe_participants(
-        wav_path=Path(wav_path),
-        hf_token=hf_token or "",
-        cfg=dcfg,
-        language=language,
-    )
+    if not merged:
+        spk_part = "" if hide_fallback_speakers else "SPEAKER_00"
+        participants = _transcribe_file(model, wav_path, speaker=spk_part, language=language)
+        mic_segs: List[Segment] = []
+        if mic_path and mic_path.exists():
+            spk_mic = "" if hide_fallback_speakers else "SPEAKER_01"
+            mic_segs = _transcribe_file(model, mic_path, speaker=spk_mic, language=language)
+        merged = _merge_segments(participants, mic_segs)
 
-    transcript_path = session_dir / "transcript-speakers.mix.txt"
-    _write_transcript_speakers_txt(transcript_path, segs_p)
+    out_mix = session_dir / "transcript-speakers.mix.txt"
+    out_fr = session_dir / "transcript_speakers_fr.txt"
 
-    return str(transcript_path)
+    text = _format_segments(merged)
+    out_mix.write_text(text, encoding="utf-8")
+    out_fr.write_text(text, encoding="utf-8")
+
+    return str(out_mix)

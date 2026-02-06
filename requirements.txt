@@ -1,8 +1,14 @@
-PyQt5==5.15.9
+PyQt6==6.7.1
 sounddevice==0.4.6
-numpy==1.24.3
-scipy==1.11.2
+numpy
+scipy
 pyaudiowpatch==0.2.12.8
 lameenc==1.5.1
 pywin32==306
 pyannote.audio
+faster-whisper
+assemblyai
+openai
+websockets
+deepgram-sdk>=3.0.0
+websockets>=12.0

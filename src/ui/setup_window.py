@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 import pyaudiowpatch as pyaudio
 import sounddevice as sd
-from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal
-from PyQt5.QtWidgets import (
+from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
@@ -22,6 +22,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QFrame,
     QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
@@ -34,6 +35,7 @@ if str(BASE_DIR) not in sys.path:
 
 from audio.wasapi_loopback import get_loopback_for_output, list_wasapi_output_devices
 from config.secure_store import appdir, getsecret, loadconfig, saveconfig, setsecret
+from common import LOG_PATH
 
 # ---------- UI constants
 FIELD_W = 520
@@ -60,14 +62,14 @@ def list_input_devices_with_api():
 
 def _make_button(text: str) -> QPushButton:
     b = QPushButton(text)
-    b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+    b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
     b.setMinimumWidth(b.sizeHint().width() + 18)
     b.setMinimumHeight(b.sizeHint().height() + 4)
     return b
 
 
 def _fix_field(w):
-    w.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+    w.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
     w.setMinimumWidth(FIELD_W)
     w.setMaximumWidth(FIELD_W)
     return w
@@ -76,7 +78,7 @@ def _fix_field(w):
 def _fix_progress(p: QProgressBar):
     p.setMinimumWidth(PROGRESS_W)
     p.setMaximumWidth(PROGRESS_W)
-    p.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+    p.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
     return p
 
 
@@ -85,10 +87,26 @@ def _make_form(parent: QWidget) -> QFormLayout:
     f.setContentsMargins(0, 0, 0, 0)
     f.setHorizontalSpacing(10)
     f.setVerticalSpacing(8)
-    f.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-    f.setFormAlignment(Qt.AlignTop | Qt.AlignLeft)
-    f.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+    f.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    f.setFormAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+    f.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
     return f
+
+
+def _section_title(text: str) -> QLabel:
+    lbl = QLabel(str(text).upper())
+    lbl.setObjectName("SectionTitle")
+    lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+    return lbl
+
+
+def _make_card(parent: QWidget) -> tuple[QFrame, QVBoxLayout]:
+    frame = QFrame(parent)
+    frame.setProperty("kind", "card")
+    layout = QVBoxLayout(frame)
+    layout.setContentsMargins(12, 10, 12, 10)
+    layout.setSpacing(8)
+    return frame, layout
 
 
 class LevelMeterSoundDevice:
@@ -236,22 +254,37 @@ class DiarizationDownloadThread(QThread):
     done = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, hf_token: str, parent=None):
+    def __init__(self, hf_token: str, model_name: str, parent=None):
         super().__init__(parent)
         self.hf_token = hf_token
+        self.model_name = model_name
 
     def run(self):
         try:
             from pyannote.audio import Pipeline
 
-            _ = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1", token=self.hf_token)
-            self.done.emit("Modèles diarization téléchargés OK.")
-        except Exception as e:
-            self.error.emit(str(e))
+            try:
+                _ = Pipeline.from_pretrained(self.model_name, use_auth_token=self.hf_token)
+            except TypeError:
+                _ = Pipeline.from_pretrained(self.model_name, token=self.hf_token)
+            self.done.emit("Modèles voix téléchargés OK.")
+            return
+        except Exception as e_py:
+            # Fallback: validate access/token via HF Hub if available
+            try:
+                from huggingface_hub import HfApi, snapshot_download
+
+                api = HfApi(token=self.hf_token)
+                _ = api.model_info(self.model_name)
+                snapshot_download(self.model_name, token=self.hf_token, allow_patterns=["*.json", "*.yaml", "*.yml"])
+                self.done.emit("Token HF validé. Modèle accessible.")
+                return
+            except Exception as e_hf:
+                self.error.emit(f"{e_py} | {e_hf}")
 
 
 class SetupWindow(QDialog):
-    def __init__(self):
+    def __init__(self, start_page: str | None = None):
         super().__init__()
 
         self.setWindowTitle("MeetingTranslator - Configuration")
@@ -275,8 +308,9 @@ class SetupWindow(QDialog):
         center.setSpacing(10)
 
         self.menu = QListWidget()
+        self.menu.setObjectName("SettingsMenu")
         self.menu.setFixedWidth(210)
-        self.menu.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.menu.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
 
         self.stack = QStackedWidget()
 
@@ -290,6 +324,8 @@ class SetupWindow(QDialog):
         bottom.addStretch(1)
         self.btnsave = _make_button("Enregistrer")
         self.btnclose = _make_button("Fermer")
+        self.btnsave.setProperty("variant", "primary")
+        self.btnclose.setProperty("variant", "ghost")
         bottom.addWidget(self.btnsave)
         bottom.addWidget(self.btnclose)
         root.addLayout(bottom)
@@ -314,12 +350,15 @@ class SetupWindow(QDialog):
 
         self._add_menu_item("AUDIO")
         self._add_menu_item("TRANSCRIPTION")
-        self._add_menu_item("POST-PROCESS")
+        self._add_menu_item("COMPTE RENDU")
         self._add_menu_item("API")
         self._add_menu_item("DEBUG / SUPPORT")
 
         self.menu.currentRowChanged.connect(self.stack.setCurrentIndex)
-        self.menu.setCurrentRow(0)
+        if start_page:
+            self._select_page(start_page)
+        else:
+            self.menu.setCurrentRow(0)
 
         self._wire_signals()
         self.loaddevices()
@@ -328,56 +367,73 @@ class SetupWindow(QDialog):
     def _add_menu_item(self, title: str):
         self.menu.addItem(QListWidgetItem(title))
 
+    def _select_page(self, title: str):
+        title = (title or "").strip().upper()
+        if title == "POST-PROCESS":
+            title = "COMPTE RENDU"
+        for i in range(self.menu.count()):
+            if self.menu.item(i).text().strip().upper() == title:
+                self.menu.setCurrentRow(i)
+                return
+        self.menu.setCurrentRow(0)
+
     def _build_page_audio(self):
         lay = QVBoxLayout(self.page_audio)
         lay.setContentsMargins(*PAGE_MARGINS)
         lay.setSpacing(PAGE_SPACING)
-        lay.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        lay.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
         title = QLabel("AUDIO")
         title.setStyleSheet("font-weight: bold;")
         lay.addWidget(title)
 
-        lay.addWidget(QLabel("Participants: sortie Windows capturée en loopback (WASAPI)."))
-        lay.addWidget(QLabel("Micro: ton micro en entrée."))
-
+        card_sources, cs = _make_card(self.page_audio)
+        cs.addWidget(_section_title("Sources audio"))
         rowp = QHBoxLayout()
         rowp.setSpacing(10)
-        rowp.setAlignment(Qt.AlignLeft)
-        rowp.addWidget(QLabel("Sortie Windows (Participants)"))
+        rowp.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        rowp.addWidget(QLabel("Sortie audio"))
         self.cbparticipants = _fix_field(QComboBox())
         rowp.addWidget(self.cbparticipants)
         self.btntestparticipants = _make_button("Tester")
+        self.btntestparticipants.setProperty("variant", "ghost")
         rowp.addWidget(self.btntestparticipants)
         rowp.addStretch(1)
-        lay.addLayout(rowp)
+        cs.addLayout(rowp)
 
         self.pbparticipants = _fix_progress(QProgressBar())
         self.pbparticipants.setRange(0, 1000)
         self.pbparticipants.setValue(0)
-        lay.addWidget(self.pbparticipants, alignment=Qt.AlignLeft)
+        cs.addWidget(self.pbparticipants, alignment=Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(card_sources)
+
+        card_mic, cm = _make_card(self.page_audio)
+        cm.addWidget(_section_title("Micro"))
 
         rowm = QHBoxLayout()
         rowm.setSpacing(10)
-        rowm.setAlignment(Qt.AlignLeft)
-        rowm.addWidget(QLabel("Micro (toi)"))
+        rowm.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        rowm.addWidget(QLabel("Entrée audio"))
         self.cbmicro = _fix_field(QComboBox())
         rowm.addWidget(self.cbmicro)
         self.btntestmicro = _make_button("Tester")
+        self.btntestmicro.setProperty("variant", "ghost")
         rowm.addWidget(self.btntestmicro)
         rowm.addStretch(1)
-        lay.addLayout(rowm)
+        cm.addLayout(rowm)
 
         self.pbmicro = _fix_progress(QProgressBar())
         self.pbmicro.setRange(0, 1000)
         self.pbmicro.setValue(0)
-        lay.addWidget(self.pbmicro, alignment=Qt.AlignLeft)
+        cm.addWidget(self.pbmicro, alignment=Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(card_mic)
 
         self.lblstatus = QLabel("Statut: prêt")
-        lay.addWidget(self.lblstatus)
+        self.lblstatus.setVisible(False)
 
         self.btnrefresh = _make_button("Rafraîchir la liste")
-        lay.addWidget(self.btnrefresh, alignment=Qt.AlignLeft)
+        self.btnrefresh.setProperty("variant", "ghost")
+        lay.addWidget(self.btnrefresh, alignment=Qt.AlignmentFlag.AlignLeft)
 
         lay.addStretch(1)
 
@@ -385,58 +441,89 @@ class SetupWindow(QDialog):
         lay = QVBoxLayout(self.page_transcription)
         lay.setContentsMargins(*PAGE_MARGINS)
         lay.setSpacing(PAGE_SPACING)
-        lay.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        lay.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
-        title = QLabel("TRANSCRIPTION (Live)")
+        title = QLabel("LIVE (transcription & traduction)")
         title.setStyleSheet("font-weight: bold;")
         lay.addWidget(title)
 
-        self.chk_enable_live = QCheckBox("Transcription temps réel (OpenAI)")
-        self.chk_enable_live.setChecked(bool(self.cfg.get("enable_live_openai", True)))
-        lay.addWidget(self.chk_enable_live)
+        card_trans, ct = _make_card(self.page_transcription)
+        ct.addWidget(_section_title("Transcription"))
+
+        self.chk_enable_live = QCheckBox("Transcription live (recommandé)")
+        self.chk_enable_live.setChecked(bool(self.cfg.get("enable_live", self.cfg.get("enable_live_openai", True))))
+        ct.addWidget(self.chk_enable_live)
+
+        form_engine = _make_form(self.page_transcription)
+        self.cb_live_engine = _fix_field(QComboBox())
+        self.cb_live_engine.addItem("Deepgram Nova-3 (meilleur pour le français)", "deepgram")
+        self.cb_live_engine.addItem("AssemblyAI (multilingue)", "assemblyai")
+        cur_engine = (self.cfg.get("live_engine") or "deepgram").lower()
+        for i in range(self.cb_live_engine.count()):
+            if self.cb_live_engine.itemData(i) == cur_engine:
+                self.cb_live_engine.setCurrentIndex(i)
+                break
+        form_engine.addRow("Moteur de transcription", self.cb_live_engine)
+        ct.addLayout(form_engine)
+
+        self.chk_format_turns = QCheckBox("Améliorer la lisibilité (ponctuation/majuscules)")
+        self.chk_format_turns.setChecked(bool(self.cfg.get("live_format_turns", True)))
+        ct.addWidget(self.chk_format_turns)
+        lay.addWidget(card_trans)
+
+        card_trad, ctr = _make_card(self.page_transcription)
+        ctr.addWidget(_section_title("Traduction"))
+
+        self.chk_live_translate = QCheckBox("Traduction live vers le français (OpenAI)")
+        self.chk_live_translate.setChecked(bool(self.cfg.get("live_enable_translation", False)))
+        ctr.addWidget(self.chk_live_translate)
 
         form = _make_form(self.page_transcription)
-
-        self.cb_source_lang = _fix_field(QComboBox())
-        self.cb_source_lang.addItem("AUTO (détection auto)", "auto")
-        self.cb_source_lang.addItem("FR (Français)", "fr")
-        self.cb_source_lang.addItem("EN (English)", "en")
-
-        cur_lang = (self.cfg.get("transcription_source_language") or "auto").lower()
-        for i in range(self.cb_source_lang.count()):
-            if self.cb_source_lang.itemData(i) == cur_lang:
-                self.cb_source_lang.setCurrentIndex(i)
-                break
-
-        form.addRow("Langue source (live)", self.cb_source_lang)
-
         self.cb_translate_model = _fix_field(QComboBox())
         self.cb_translate_model.addItem("gpt-4o-mini (rapide, économe)", "gpt-4o-mini")
         self.cb_translate_model.addItem("gpt-4o (meilleur, plus coûteux)", "gpt-4o")
-
-        cur_model = (self.cfg.get("transcription_translate_model") or "gpt-4o").lower()
+        cur_model = (self.cfg.get("live_translate_model") or "gpt-4o-mini").lower()
         for i in range(self.cb_translate_model.count()):
             if self.cb_translate_model.itemData(i) == cur_model:
                 self.cb_translate_model.setCurrentIndex(i)
                 break
+        form.addRow("Qualité de traduction (OpenAI)", self.cb_translate_model)
+        ctr.addLayout(form)
+        lay.addWidget(card_trad)
 
-        form.addRow("Modèle traduction (OpenAI)", self.cb_translate_model)
+        card_people, cp = _make_card(self.page_transcription)
+        cp.addWidget(_section_title("Identification des voix"))
 
-        self.cb_commit = _fix_field(QComboBox())
-        self.cb_commit.addItem("0.5 s (très réactif)", 0.5)
-        self.cb_commit.addItem("1.0 s (normal)", 1.0)
-        self.cb_commit.addItem("2.0 s (moins de coupures)", 2.0)
+        form_voice = _make_form(self.page_transcription)
+        self.cb_voice_ident_mode = _fix_field(QComboBox())
+        self.cb_voice_ident_mode.addItem(
+            "Fiable (recommandé) : voix uniquement dans le compte rendu",
+            "report_only",
+        )
+        self.cb_voice_ident_mode.addItem(
+            "Live (beta) : tentative en direct + compte rendu",
+            "live_beta",
+        )
+        cur_voice_mode = str(self.cfg.get("voice_identification_mode") or "").strip().lower()
+        if cur_voice_mode not in ("report_only", "live_beta"):
+            cur_voice_mode = "live_beta" if bool(self.cfg.get("live_speaker_labels", False)) else "report_only"
+        self.cb_voice_ident_mode.setCurrentIndex(1 if cur_voice_mode == "live_beta" else 0)
+        form_voice.addRow("Mode", self.cb_voice_ident_mode)
+        cp.addLayout(form_voice)
 
-        current_commit = float(self.cfg.get("live_commit_every_seconds", 1.0) or 1.0)
-        best_i = 1
-        for i in range(self.cb_commit.count()):
-            if abs(float(self.cb_commit.itemData(i)) - current_commit) < 0.01:
-                best_i = i
-                break
-        self.cb_commit.setCurrentIndex(best_i)
+        self.lbl_voice_hint = QLabel(
+            "Conseil: en réunion longue, utilise 'Fiable' pour éviter les confusions en live."
+        )
+        cp.addWidget(self.lbl_voice_hint)
 
-        form.addRow("Découpe phrases live (commit)", self.cb_commit)
-        lay.addLayout(form)
+        self.chk_live_speaker_labels = QCheckBox("Activer les labels de voix en live (PERSONNE 1, 2, ...)")
+        self.chk_live_speaker_labels.setChecked(bool(self.cfg.get("live_speaker_labels", False)))
+        cp.addWidget(self.chk_live_speaker_labels)
+
+        self.chk_live_speaker_labels_delayed = QCheckBox("Affecter les labels avec léger retard (plus stable)")
+        self.chk_live_speaker_labels_delayed.setChecked(bool(self.cfg.get("live_speaker_labels_delayed", False)))
+        cp.addWidget(self.chk_live_speaker_labels_delayed)
+        lay.addWidget(card_people)
 
         lay.addStretch(1)
 
@@ -444,42 +531,77 @@ class SetupWindow(QDialog):
         lay = QVBoxLayout(self.page_postprocess)
         lay.setContentsMargins(*PAGE_MARGINS)
         lay.setSpacing(PAGE_SPACING)
-        lay.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        lay.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
-        title = QLabel("POST-PROCESS")
+        title = QLabel("COMPTE RENDU")
         title.setStyleSheet("font-weight: bold;")
         lay.addWidget(title)
 
-        self.chk_enable_post = QCheckBox("Activer post-process après STOP (speaker A/B + transcription)")
+        self.chk_enable_post = QCheckBox("Après STOP: lancer transcription + compte rendu")
         self.chk_enable_post.setChecked(bool(self.cfg.get("enable_postprocess", False)))
         lay.addWidget(self.chk_enable_post)
 
+        card_lang, cl = _make_card(self.page_postprocess)
+        cl.addWidget(_section_title("Langue & qualité"))
         form = _make_form(self.page_postprocess)
 
         self.cb_post_lang = _fix_field(QComboBox())
-        self.cb_post_lang.addItem("AUTO (mix)", "auto")
-        self.cb_post_lang.addItem("FR", "fr")
-        self.cb_post_lang.addItem("EN", "en")
+        self.cb_post_lang.addItem("Automatique (mix)", "auto")
+        self.cb_post_lang.addItem("Francais", "fr")
+        self.cb_post_lang.addItem("Anglais", "en")
         curlang = (self.cfg.get("postprocess_language") or "auto").lower()
         self.cb_post_lang.setCurrentIndex(0 if curlang == "auto" else (1 if curlang == "fr" else 2))
-        form.addRow("Langue post-process", self.cb_post_lang)
+        form.addRow("Langue du compte rendu", self.cb_post_lang)
 
         self.cb_post_quality = _fix_field(QComboBox())
-        self.cb_post_quality.addItem("STANDARD (plus rapide)", "standard")
-        self.cb_post_quality.addItem("PRECISE (meilleur)", "precise")
+        self.cb_post_quality.addItem("Standard (plus rapide)", "standard")
+        self.cb_post_quality.addItem("Précis (meilleur, plus lent)", "precise")
         curq = (self.cfg.get("postprocess_quality") or "standard").lower()
         self.cb_post_quality.setCurrentIndex(0 if curq == "standard" else 1)
-        form.addRow("Qualité post-process", self.cb_post_quality)
+        form.addRow("Qualité du compte rendu", self.cb_post_quality)
 
-        lay.addLayout(form)
+        self.cb_post_device = _fix_field(QComboBox())
+        self.cb_post_device.addItem("Auto (prend le GPU si dispo)", "auto")
+        self.cb_post_device.addItem("GPU (plus rapide)", "cuda")
+        self.cb_post_device.addItem("CPU (plus lent)", "cpu")
+        curd = (self.cfg.get("postprocess_device") or self.cfg.get("device") or "auto").lower()
+        self.cb_post_device.setCurrentIndex(0 if curd == "auto" else (1 if curd == "cuda" else 2))
+        form.addRow("Exécution", self.cb_post_device)
 
-        self.chk_generate_docx = QCheckBox("Générer DOCX (compte-rendu)")
+        cl.addLayout(form)
+        lay.addWidget(card_lang)
+
+        card_out, co = _make_card(self.page_postprocess)
+        co.addWidget(_section_title("Sorties"))
+        self.chk_generate_docx = QCheckBox("Générer le document DOCX")
         self.chk_generate_docx.setChecked(bool(self.cfg.get("postprocess_generate_docx", True)))
-        lay.addWidget(self.chk_generate_docx)
+        co.addWidget(self.chk_generate_docx)
 
-        self.chk_enable_pplx = QCheckBox("Résumé via Perplexity (si clé)")
+        self.chk_enable_pplx = QCheckBox("Résumé structuré automatique (Perplexity)")
         self.chk_enable_pplx.setChecked(bool(self.cfg.get("postprocess_enable_perplexity_summary", True)))
-        lay.addWidget(self.chk_enable_pplx)
+        co.addWidget(self.chk_enable_pplx)
+        lay.addWidget(card_out)
+
+        card_people, cp = _make_card(self.page_postprocess)
+        cp.addWidget(_section_title("Personnes & voix"))
+        self.cb_diar_mode = _fix_field(QComboBox())
+        self.cb_diar_mode.addItem("Par voix (plus précis, nécessite token HF)", "voice")
+        self.cb_diar_mode.addItem("Par source (simple: micro/participants)", "source")
+        cur_mode = str(self.cfg.get("postprocess_diarization_mode") or "").lower()
+        if not cur_mode:
+            if not bool(self.cfg.get("postprocess_enable_diarization", self.cfg.get("enable_diarization", True))):
+                cur_mode = "source"
+            else:
+                cur_mode = "voice"
+        self.cb_diar_mode.setCurrentIndex(0 if cur_mode == "voice" else 1)
+        form2 = _make_form(self.page_postprocess)
+        form2.addRow("Séparation des voix", self.cb_diar_mode)
+        cp.addLayout(form2)
+
+        self.chk_extract_participants = QCheckBox("Déduire les noms des participants (IA, option)")
+        self.chk_extract_participants.setChecked(bool(self.cfg.get("postprocess_extract_participants", False)))
+        cp.addWidget(self.chk_extract_participants)
+        lay.addWidget(card_people)
 
         lay.addStretch(1)
 
@@ -487,44 +609,62 @@ class SetupWindow(QDialog):
         lay = QVBoxLayout(self.page_api)
         lay.setContentsMargins(*PAGE_MARGINS)
         lay.setSpacing(PAGE_SPACING)
-        lay.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        lay.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
         title = QLabel("API")
         title.setStyleSheet("font-weight: bold;")
         lay.addWidget(title)
 
-        lay.addWidget(QLabel("Clés API (optionnel)"))
+        card_keys, ck = _make_card(self.page_api)
+        ck.addWidget(_section_title("Clés API"))
+        ck.addWidget(QLabel("Optionnel mais nécessaire pour certaines fonctions."))
 
         form = _make_form(self.page_api)
 
         self.in_openai = _fix_field(QLineEdit())
-        self.in_openai.setEchoMode(QLineEdit.Password)
+        self.in_openai.setEchoMode(QLineEdit.EchoMode.Password)
         if getsecret(self.cfg, "openai_api_key"):
             self.in_openai.setPlaceholderText("Déjà configuré (laisser vide pour ne pas changer)")
-        form.addRow("OpenAI API Key", self.in_openai)
+        form.addRow("OpenAI API Key (traduction live)", self.in_openai)
+
+        self.in_deepgram = _fix_field(QLineEdit())
+        self.in_deepgram.setEchoMode(QLineEdit.EchoMode.Password)
+        if getsecret(self.cfg, "deepgram_api_key"):
+            self.in_deepgram.setPlaceholderText("Déjà configuré (laisser vide pour ne pas changer)")
+        form.addRow("Deepgram API Key (transcription live)", self.in_deepgram)
+
+        self.in_assemblyai = _fix_field(QLineEdit())
+        self.in_assemblyai.setEchoMode(QLineEdit.EchoMode.Password)
+        if getsecret(self.cfg, "assemblyai_api_key"):
+            self.in_assemblyai.setPlaceholderText("Déjà configuré (laisser vide pour ne pas changer)")
+        form.addRow("AssemblyAI API Key (optionnel)", self.in_assemblyai)
 
         self.inpplx = _fix_field(QLineEdit())
-        self.inpplx.setEchoMode(QLineEdit.Password)
+        self.inpplx.setEchoMode(QLineEdit.EchoMode.Password)
         if getsecret(self.cfg, "perplexityapikey"):
             self.inpplx.setPlaceholderText("Déjà configuré (laisser vide pour ne pas changer)")
-        form.addRow("Perplexity API Key", self.inpplx)
+        form.addRow("Perplexity API Key (résumé)", self.inpplx)
 
-        lay.addLayout(form)
+        ck.addLayout(form)
+        lay.addWidget(card_keys)
 
-        lay.addWidget(QLabel("Speaker A/B (post-process)"))
+        card_voice, cv = _make_card(self.page_api)
+        cv.addWidget(_section_title("Séparation des voix"))
 
         form2 = _make_form(self.page_api)
 
         self.inhftoken = _fix_field(QLineEdit())
-        self.inhftoken.setEchoMode(QLineEdit.Password)
+        self.inhftoken.setEchoMode(QLineEdit.EchoMode.Password)
         if getsecret(self.cfg, "hf_token"):
             self.inhftoken.setPlaceholderText("Déjà configuré (laisser vide pour ne pas changer)")
-        form2.addRow("HuggingFace Token (read)", self.inhftoken)
+        form2.addRow("HuggingFace Token (diarization)", self.inhftoken)
 
-        lay.addLayout(form2)
+        cv.addLayout(form2)
 
-        self.btndownloadmodels = _make_button("Télécharger/Tester modèles diarization")
-        lay.addWidget(self.btndownloadmodels, alignment=Qt.AlignLeft)
+        self.btndownloadmodels = _make_button("Télécharger/Tester les modèles voix")
+        self.btndownloadmodels.setProperty("variant", "ghost")
+        cv.addWidget(self.btndownloadmodels, alignment=Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(card_voice)
 
         lay.addStretch(1)
 
@@ -532,21 +672,25 @@ class SetupWindow(QDialog):
         lay = QVBoxLayout(self.page_debug)
         lay.setContentsMargins(*PAGE_MARGINS)
         lay.setSpacing(PAGE_SPACING)
-        lay.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        lay.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
         title = QLabel("DEBUG / SUPPORT")
         title.setStyleSheet("font-weight: bold;")
         lay.addWidget(title)
 
+        card_logs, cl = _make_card(self.page_debug)
+        cl.addWidget(_section_title("Logs & support"))
+
         self.chk_debug = QCheckBox("Activer logs debug (utile pour support)")
         self.chk_debug.setChecked(bool(self.cfg.get("debug_enabled", False)))
-        lay.addWidget(self.chk_debug)
+        cl.addWidget(self.chk_debug)
 
         self.chk_show_debug_panel = QCheckBox("Afficher panneau logs debug dans l'app")
         self.chk_show_debug_panel.setChecked(bool(self.cfg.get("debug_show_panel", False)))
-        lay.addWidget(self.chk_show_debug_panel)
+        cl.addWidget(self.chk_show_debug_panel)
 
-        lay.addWidget(QLabel(f"Chemin logs: {appdir() / 'debug_runtime.log'}"))
+        cl.addWidget(QLabel(f"Chemin logs: {LOG_PATH}"))
+        lay.addWidget(card_logs)
 
         lay.addStretch(1)
 
@@ -556,8 +700,10 @@ class SetupWindow(QDialog):
         self.btntestmicro.clicked.connect(lambda: self.toggletest("micro"))
 
         self.chk_enable_live.stateChanged.connect(self._apply_enabled_states)
+        self.chk_live_translate.stateChanged.connect(self._apply_enabled_states)
         self.chk_enable_post.stateChanged.connect(self._apply_enabled_states)
         self.chk_debug.stateChanged.connect(self._apply_enabled_states)
+        self.cb_voice_ident_mode.currentIndexChanged.connect(self._apply_enabled_states)
 
         self.btndownloadmodels.clicked.connect(self.download_models)
 
@@ -574,15 +720,23 @@ class SetupWindow(QDialog):
 
     def _apply_enabled_states(self):
         live_on = bool(self.chk_enable_live.isChecked())
-        self.cb_source_lang.setEnabled(live_on)
-        self.cb_translate_model.setEnabled(live_on)
-        self.cb_commit.setEnabled(live_on)
+        self.chk_format_turns.setEnabled(live_on)
+        self.chk_live_translate.setEnabled(live_on)
+        self.cb_translate_model.setEnabled(live_on and self.chk_live_translate.isChecked())
+        mode = str(self.cb_voice_ident_mode.currentData() or "report_only")
+        live_beta = mode == "live_beta"
+        self.lbl_voice_hint.setEnabled(live_on)
+        self.chk_live_speaker_labels.setEnabled(live_on and live_beta)
+        self.chk_live_speaker_labels_delayed.setEnabled(live_on and live_beta and self.chk_live_speaker_labels.isChecked())
 
         post_on = bool(self.chk_enable_post.isChecked())
         self.cb_post_lang.setEnabled(post_on)
         self.cb_post_quality.setEnabled(post_on)
+        self.cb_post_device.setEnabled(post_on)
         self.chk_generate_docx.setEnabled(post_on)
         self.chk_enable_pplx.setEnabled(post_on)
+        self.cb_diar_mode.setEnabled(post_on)
+        self.chk_extract_participants.setEnabled(post_on)
 
         dbg_on = bool(self.chk_debug.isChecked())
         self.chk_show_debug_panel.setEnabled(dbg_on)
@@ -669,13 +823,18 @@ class SetupWindow(QDialog):
             token = getsecret(self.cfg, "hf_token") or ""
 
         if not token:
-            QMessageBox.warning(self, "Token manquant", "Renseigne un HuggingFace Token (read) puis retente.")
+            QMessageBox.warning(
+                self,
+                "Token manquant",
+                "Renseigne un HuggingFace Token pour la séparation par voix puis retente.",
+            )
             return
 
         self.btndownloadmodels.setEnabled(False)
         self.lblstatus.setText("Statut: téléchargement diarization en cours...")
 
-        self._dlthread = DiarizationDownloadThread(token)
+        model_name = str(self.cfg.get("diarization_model") or "pyannote/speaker-diarization-3.1")
+        self._dlthread = DiarizationDownloadThread(token, model_name)
         self._dlthread.done.connect(self._on_dl_done)
         self._dlthread.error.connect(self._on_dl_error)
         self._dlthread.start()
@@ -688,32 +847,74 @@ class SetupWindow(QDialog):
     def _on_dl_error(self, err: str):
         self.btndownloadmodels.setEnabled(True)
         self.lblstatus.setText("Statut: prêt")
-        QMessageBox.critical(self, "Erreur diarization", err)
+        msg = err
+        low = (err or "").lower()
+        if "pyannote" in low or "huggingface_hub" in low:
+            msg = (
+                "Impossible de télécharger/tester les modèles voix.\n"
+                "Vérifie le token HF et que pyannote.audio est installé.\n"
+                "Sinon, utilise la séparation par source (micro/participants)."
+            )
+        QMessageBox.critical(self, "Erreur modèles voix", msg)
 
     def save(self):
         self.cfg["participantsoutputdeviceid"] = int(self.cbparticipants.currentData())
         self.cfg["microdeviceid"] = int(self.cbmicro.currentData())
 
-        self.cfg["enable_live_openai"] = bool(self.chk_enable_live.isChecked())
-        self.cfg["transcription_source_language"] = str(self.cb_source_lang.currentData())
-        self.cfg["transcription_translate_model"] = str(self.cb_translate_model.currentData())
-        self.cfg["live_commit_every_seconds"] = float(self.cb_commit.currentData())
+        self.cfg["enable_live"] = bool(self.chk_enable_live.isChecked())
+        self.cfg["live_engine"] = str(self.cb_live_engine.currentData())
+        self.cfg["live_format_turns"] = bool(self.chk_format_turns.isChecked())
+        self.cfg["live_enable_translation"] = bool(self.chk_live_translate.isChecked())
+        self.cfg["live_translate_model"] = str(self.cb_translate_model.currentData())
+        voice_mode = str(self.cb_voice_ident_mode.currentData() or "report_only")
+        self.cfg["voice_identification_mode"] = voice_mode
+        if voice_mode == "live_beta":
+            self.cfg["live_speaker_labels"] = bool(self.chk_live_speaker_labels.isChecked())
+            self.cfg["live_speaker_labels_delayed"] = bool(self.chk_live_speaker_labels_delayed.isChecked())
+        else:
+            self.cfg["live_speaker_labels"] = False
+            self.cfg["live_speaker_labels_delayed"] = False
+        for k in (
+            "enable_live_openai",
+            "live_provider",
+            "transcription_source_language",
+            "transcription_translate_model",
+            "live_transcribe_model",
+            "live_noise_reduction",
+            "live_commit_every_seconds",
+            "live_use_server_vad",
+            "live_vad_threshold",
+            "live_vad_prefix_padding_ms",
+            "live_vad_silence_duration_ms",
+            "live_stitch_gap_s",
+        ):
+            self.cfg.pop(k, None)
 
         self.cfg["enable_postprocess"] = bool(self.chk_enable_post.isChecked())
         self.cfg["postprocess_language"] = str(self.cb_post_lang.currentData())
         self.cfg["postprocess_quality"] = str(self.cb_post_quality.currentData())
+        self.cfg["postprocess_device"] = str(self.cb_post_device.currentData())
         self.cfg["postprocess_generate_docx"] = bool(self.chk_generate_docx.isChecked())
         self.cfg["postprocess_enable_perplexity_summary"] = bool(self.chk_enable_pplx.isChecked())
+        self.cfg["postprocess_diarization_mode"] = str(self.cb_diar_mode.currentData())
+        self.cfg["postprocess_enable_diarization"] = bool(self.cb_diar_mode.currentData() == "voice")
+        self.cfg["postprocess_extract_participants"] = bool(self.chk_extract_participants.isChecked())
 
         self.cfg["debug_enabled"] = bool(self.chk_debug.isChecked())
         self.cfg["debug_show_panel"] = bool(self.chk_show_debug_panel.isChecked())
 
         openai = self.in_openai.text().strip()
+        deepgram = self.in_deepgram.text().strip()
+        aai = self.in_assemblyai.text().strip()
         pplx = self.inpplx.text().strip()
         hft = self.inhftoken.text().strip()
 
         if openai:
             setsecret(self.cfg, "openai_api_key", openai)
+        if deepgram:
+            setsecret(self.cfg, "deepgram_api_key", deepgram)
+        if aai:
+            setsecret(self.cfg, "assemblyai_api_key", aai)
         if pplx:
             setsecret(self.cfg, "perplexityapikey", pplx)
         if hft:

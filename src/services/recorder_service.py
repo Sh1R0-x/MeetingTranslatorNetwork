@@ -40,29 +40,56 @@ class TrackSpec:
 
 
 class _WavRotatingWriter:
-    def __init__(self, base_dir: Path, time_prefix: str, label: str, samplerate: int, channels: int):
+    def __init__(
+        self,
+        base_dir: Path,
+        time_prefix: str,
+        label: str,
+        samplerate: int,
+        channels: int,
+        on_part_closed=None,
+    ):
         self.base_dir = Path(base_dir)
         self.time_prefix = str(time_prefix)
         self.label = _safe_name(label)
         self.samplerate = int(samplerate)
         self.channels = int(channels)
+        self._on_part_closed = on_part_closed
 
         self.part_index = 1
         self.frames_written = 0
 
         self.wav: Optional[wave.Wave_write] = None
         self.paths: List[Path] = []
+        self._current_path: Optional[Path] = None
+        self._emitted_paths = set()
 
         self._open_new_part()
 
+    def _emit_closed(self, path: Optional[Path]):
+        if not path:
+            return
+        if path in self._emitted_paths:
+            return
+        self._emitted_paths.add(path)
+        if callable(self._on_part_closed):
+            try:
+                self._on_part_closed(path)
+            except Exception:
+                pass
+
     def _open_new_part(self):
         if self.wav is not None:
-            self.wav.close()
+            try:
+                self.wav.close()
+            finally:
+                self._emit_closed(self._current_path)
 
         part = f"Partie{self.part_index:02d}"
         filename = f"{self.time_prefix} - {self.label} - {part}.wav"
         path = self.base_dir / filename
         self.paths.append(path)
+        self._current_path = path
 
         wf = wave.open(str(path), "wb")
         wf.setnchannels(self.channels)
@@ -89,7 +116,10 @@ class _WavRotatingWriter:
 
     def close(self):
         if self.wav is not None:
-            self.wav.close()
+            try:
+                self.wav.close()
+            finally:
+                self._emit_closed(self._current_path)
         self.wav = None
 
 
@@ -99,7 +129,7 @@ class RecorderService:
     - Participants: loopback de la sortie Windows (WASAPI) en PCM16 via PyAudioWPatch
     - Micro: entrée micro via sounddevice (float32) convertie en PCM16
 
-    En plus, tu peux brancher une queue live (participants) pour envoyer l'audio vers une transcription live.
+    En plus, tu peux brancher une queue live (participants ou micro) pour envoyer l'audio vers une transcription live.
     """
 
     def __init__(
@@ -113,7 +143,7 @@ class RecorderService:
         self.participants_output_device_id = int(participants_output_device_id)
         self.mic_device_id = int(mic_device_id)
 
-        # Dossier par défaut (celui qu'on voulait dans la discussion)
+        # Dossier par défaut
         self.output_root = Path(output_root) if output_root else (Path.home() / "Documents" / "MeetingTranslatorNetwork")
 
         self.participants_label = participants_label
@@ -124,11 +154,14 @@ class RecorderService:
         self._q_part = queue.Queue()
         self._q_mic = queue.Queue()
 
-        # LIVE (participants): on met (bytes_pcm16, frames) ou None
+        # LIVE: on met (bytes_pcm16, frames) ou None
         self._q_live_part = None
+        self._q_live_mic = None
 
         self.participants_rate: Optional[int] = None
         self.participants_channels: Optional[int] = None
+        self.mic_rate: Optional[int] = None
+        self.mic_channels: Optional[int] = None
 
         self._writer_part: Optional[_WavRotatingWriter] = None
         self._writer_mic: Optional[_WavRotatingWriter] = None
@@ -145,9 +178,28 @@ class RecorderService:
         self.participants_track = TrackSpec(label=self.participants_label, wav_paths=[])
         self.my_track = TrackSpec(label=self.my_audio_label, wav_paths=[])
 
-    # IMPORTANT: signature simple (évite les soucis d'import/circular)
+        # Optional callbacks notified when a WAV part is closed.
+        self._part_closed_callbacks = []
+
+    def add_part_closed_callback(self, cb):
+        if callable(cb):
+            self._part_closed_callbacks.append(cb)
+
+    def clear_part_closed_callbacks(self):
+        self._part_closed_callbacks = []
+
+    def _emit_part_closed(self, label: str, path: Path):
+        for cb in list(self._part_closed_callbacks):
+            try:
+                cb(label, path)
+            except Exception:
+                pass
+
     def set_live_participants_queue(self, q):
         self._q_live_part = q
+
+    def set_live_mic_queue(self, q):
+        self._q_live_mic = q
 
     def start(self):
         if self._running:
@@ -178,6 +230,7 @@ class RecorderService:
             label=self.participants_label,
             samplerate=part_rate,
             channels=part_channels,
+            on_part_closed=lambda p: self._emit_part_closed(self.participants_label, p),
         )
 
         self._t_part = threading.Thread(target=self._writer_loop_participants, daemon=True)
@@ -215,6 +268,8 @@ class RecorderService:
         mic_dev = sd.query_devices(self.mic_device_id, "input")
         mic_rate = int(mic_dev["default_samplerate"])
         mic_channels = 1
+        self.mic_rate = mic_rate
+        self.mic_channels = mic_channels
 
         self._writer_mic = _WavRotatingWriter(
             base_dir=self.session_dir,
@@ -222,6 +277,7 @@ class RecorderService:
             label=self.my_audio_label,
             samplerate=mic_rate,
             channels=mic_channels,
+            on_part_closed=lambda p: self._emit_part_closed(self.my_audio_label, p),
         )
 
         self._t_mic = threading.Thread(target=self._writer_loop_mic, daemon=True)
@@ -232,6 +288,11 @@ class RecorderService:
                 mono = indata[:, 0] if getattr(indata, "ndim", 1) > 1 else indata
                 i16 = (np.clip(mono, -1.0, 1.0) * 32767).astype(np.int16)
                 self._q_mic.put((i16.tobytes(), int(frames)))
+                if self._q_live_mic is not None:
+                    try:
+                        self._q_live_mic.put_nowait((i16.tobytes(), int(frames)))
+                    except queue.Full:
+                        pass
             except Exception:
                 pass
 
@@ -249,59 +310,147 @@ class RecorderService:
         self._running = True
 
     def stop(self):
+        """
+        Stop "durci" pour éviter les freezes drivers (WASAPI / sounddevice / pyaudio).
+        + IMPORTANT: ne jamais bloquer sur la live queue (maxsize).
+        """
+        import time
+
         if not self._running:
             return
 
+        t0 = time.perf_counter()
+        print("[Recorder.stop] BEGIN")
+
         self._running = False
 
-        # Stop sounddevice mic
+        def _call_with_timeout(fn, timeout_sec: float, label: str):
+            done = {"err": None}
+
+            def _run():
+                try:
+                    fn()
+                except Exception as e:
+                    done["err"] = repr(e)
+
+            th = threading.Thread(target=_run, daemon=True)
+            th.start()
+            th.join(timeout=timeout_sec)
+
+            if th.is_alive():
+                print(f"[Recorder.stop] TIMEOUT on {label} after {timeout_sec}s (continue)")
+                return False
+
+            if done["err"] is not None:
+                print(f"[Recorder.stop] ERROR on {label}: {done['err']}")
+            else:
+                print(f"[Recorder.stop] OK {label}")
+            return True
+
+        # ---- Stop sounddevice mic ----
         if self._sd_stream is not None:
-            try:
-                self._sd_stream.stop()
-                self._sd_stream.close()
-            except Exception:
-                pass
-        self._sd_stream = None
+            s = self._sd_stream
+            print("[Recorder.stop] mic: stop/close start")
+            if hasattr(s, "abort"):
+                _call_with_timeout(lambda: s.abort(), 2.0, "sd_stream.abort")
+            else:
+                _call_with_timeout(lambda: s.stop(), 2.0, "sd_stream.stop")
+            _call_with_timeout(lambda: s.close(), 2.0, "sd_stream.close")
+            self._sd_stream = None
+            print("[Recorder.stop] mic: stop/close done")
+        else:
+            print("[Recorder.stop] mic: no stream")
 
-        # Stop pyaudio loopback
+        # ---- Stop pyaudio loopback ----
         if self._pa_stream is not None:
-            try:
-                self._pa_stream.stop_stream()
-                self._pa_stream.close()
-            except Exception:
-                pass
-        self._pa_stream = None
+            ps = self._pa_stream
+            print("[Recorder.stop] loopback: stop/close start")
 
+            def _stop_stream():
+                try:
+                    if hasattr(ps, "is_active"):
+                        if ps.is_active():
+                            ps.stop_stream()
+                        else:
+                            ps.stop_stream()
+                    else:
+                        ps.stop_stream()
+                except Exception:
+                    pass
+
+            _call_with_timeout(_stop_stream, 2.0, "pa_stream.stop_stream")
+            _call_with_timeout(lambda: ps.close(), 2.0, "pa_stream.close")
+            self._pa_stream = None
+            print("[Recorder.stop] loopback: stop/close done")
+        else:
+            print("[Recorder.stop] loopback: no stream")
+
+        # ---- Terminate pyaudio ----
         if self._pa is not None:
-            try:
-                self._pa.terminate()
-            except Exception:
-                pass
-        self._pa = None
+            pa = self._pa
+            print("[Recorder.stop] pyaudio: terminate start")
+            _call_with_timeout(lambda: pa.terminate(), 2.0, "pyaudio.terminate")
+            self._pa = None
+            print("[Recorder.stop] pyaudio: terminate done")
+        else:
+            print("[Recorder.stop] pyaudio: no instance")
 
-        # Stop writer threads
-        self._q_part.put(None)
-        self._q_mic.put(None)
+        # ---- Stop writer threads ----
+        print("[Recorder.stop] writers: send sentinel")
+        try:
+            self._q_part.put(None)
+        except Exception:
+            pass
+        try:
+            self._q_mic.put(None)
+        except Exception:
+            pass
 
+        # IMPORTANT: live queue can be full -> NEVER BLOCK
         if self._q_live_part is not None:
             try:
-                self._q_live_part.put(None)
-            except Exception:
-                pass
+                self._q_live_part.put_nowait(None)
+                print("[Recorder.stop] live: sentinel queued (nowait)")
+            except queue.Full:
+                # live thread already stopped; sentinel not mandatory
+                print("[Recorder.stop] live: queue full -> sentinel skipped")
+        if self._q_live_mic is not None:
+            try:
+                self._q_live_mic.put_nowait(None)
+                print("[Recorder.stop] live mic: sentinel queued (nowait)")
+            except queue.Full:
+                print("[Recorder.stop] live mic: queue full -> sentinel skipped")
 
-        if self._t_part is not None:
-            self._t_part.join(timeout=5)
-        if self._t_mic is not None:
-            self._t_mic.join(timeout=5)
+        print("[Recorder.stop] writers: join threads")
+        try:
+            if self._t_part is not None:
+                self._t_part.join(timeout=5)
+        except Exception:
+            pass
+        try:
+            if self._t_mic is not None:
+                self._t_mic.join(timeout=5)
+        except Exception:
+            pass
 
-        # Close writers and expose file paths
-        if self._writer_part is not None:
-            self._writer_part.close()
-            self.participants_track.wav_paths = list(self._writer_part.paths)
+        # ---- Close writers and expose file paths ----
+        print("[Recorder.stop] writers: close files")
+        try:
+            if self._writer_part is not None:
+                self._writer_part.close()
+                self.participants_track.wav_paths = list(self._writer_part.paths)
+        except Exception as e:
+            print(f"[Recorder.stop] writer_part close error: {e!r}")
 
-        if self._writer_mic is not None:
-            self._writer_mic.close()
-            self.my_track.wav_paths = list(self._writer_mic.paths)
+        try:
+            if self._writer_mic is not None:
+                self._writer_mic.close()
+                self.my_track.wav_paths = list(self._writer_mic.paths)
+        except Exception as e:
+            print(f"[Recorder.stop] writer_mic close error: {e!r}")
+
+        dt = time.perf_counter() - t0
+        print(f"[Recorder.stop] END ({dt:.3f}s)")
 
     def _writer_loop_participants(self):
         while True:

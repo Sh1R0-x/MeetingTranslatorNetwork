@@ -5,8 +5,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config.secure_store import load_config, save_config, set_secret, get_secret
 
-KEY = "openai_api_key"
-TEST_VALUE = "TEST_OPENAI_123"
+KEY = "assemblyai_api_key"
+TEST_VALUE = "TEST_ASSEMBLYAI_123"
 
 cfg = load_config()
 old = cfg.get(KEY)

@@ -1,240 +1,260 @@
 from __future__ import annotations
 
-import re
+import os
+import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, Tuple, Optional
 
 import requests
 from docx import Document
-from docx.shared import Pt
 
-try:
-    from argostranslate import translate as argos_translate
-except Exception:
-    argos_translate = None
+from config.secure_store import getsecret
 
-
-# Support 2 formats :
-# 1) [HH:MM:SS - HH:MM:SS] SPEAKER: TEXT
-# 2) HH:MM:SS - HH:MM:SS SPEAKER TEXT
-_TRANSCRIPT_RE = re.compile(
-    r"^(?:\[(\d{2}:\d{2}:\d{2})\s*-\s*(\d{2}:\d{2}:\d{2})\]\s+([A-Za-z0-9_]+)\s*:\s*(.*)"
-    r"|(\d{2}:\d{2}:\d{2})\s*-\s*(\d{2}:\d{2}:\d{2})\s+([A-Za-z0-9_]+)\s+(.*))$"
-)
+PPLX_URL = "https://api.perplexity.ai/chat/completions"
+DEFAULT_MODEL = "sonar"
+DEFAULT_TIMEOUT_S = 60
+MAX_RETRIES = 3
 
 
 @dataclass
-class TranscriptLine:
-    start: str
-    end: str
-    speaker: str
-    text: str
+class SummaryResult:
+    ok: bool
+    text: str = ""
+    error: str = ""
+    status_code: Optional[int] = None
 
 
-class MeetingSummaryService:
-    """
-    Génère un DOCX final.
-    - Ajoute une table de transcription + traduction FR (si Argos est dispo).
-    - Ajoute un résumé via Perplexity si API key fournie (sinon section simple).
-    """
+def _write_text(path: Path, content: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
 
-    def __init__(self, perplexity_api_key: str = ""):
-        self.perplexity_api_key = perplexity_api_key or ""
 
-        # Init translator once (Argos)
-        self._translator_en_fr = None
-        if argos_translate is not None:
-            try:
-                langs = argos_translate.get_installed_languages()
-                en = next((l for l in langs if l.code == "en"), None)
-                fr = next((l for l in langs if l.code == "fr"), None)
-                if en and fr:
-                    self._translator_en_fr = en.get_translation(fr)
-            except Exception:
-                self._translator_en_fr = None
+def _is_pplx_key(v: str) -> bool:
+    v = (v or "").strip()
+    return v.startswith("pplx-") and len(v) >= 20
 
-    def _parse_transcript(self, transcript_path: Path) -> List[TranscriptLine]:
-        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        out: List[TranscriptLine] = []
 
-        for ln in lines:
-            ln = ln.strip()
-            if not ln:
-                continue
+def _get_perplexity_key(cfg: Dict[str, Any]) -> Tuple[str, str]:
+    tried = []
 
-            m = _TRANSCRIPT_RE.match(ln)
-            if not m:
-                continue
+    secure_keys = [
+        "perplexity_api_key",
+        "perplexity_key",
+        "pplx_api_key",
+        "perplexity_token",
+        "pplx_token",
+        "perplexityapikey",
+        "perplexity",
+        "pplx",
+        "api_perplexity_key",
+    ]
+    for k in secure_keys:
+        tried.append(f"secure_store:{k}")
+        v = (getsecret(cfg, k) or "").strip()
+        if _is_pplx_key(v):
+            return v, f"secure_store:{k}"
 
-            # Groupes pour format 1
-            if m.group(1) is not None:
-                start, end, spk, text = m.group(1), m.group(2), m.group(3), m.group(4)
-            else:
-                # Groupes pour format 2
-                start, end, spk, text = m.group(5), m.group(6), m.group(7), m.group(8)
+    cfg_keys = secure_keys
+    for k in cfg_keys:
+        tried.append(f"cfg:{k}")
+        v = str((cfg or {}).get(k, "")).strip()
+        if _is_pplx_key(v):
+            return v, f"cfg:{k}"
 
-            text = (text or "").strip()
-            if not text:
-                continue
+    env_keys = ["PERPLEXITY_API_KEY", "PPLX_API_KEY", "PERPLEXITY_KEY", "PPLX_KEY"]
+    for k in env_keys:
+        tried.append(f"env:{k}")
+        v = (os.getenv(k) or "").strip()
+        if _is_pplx_key(v):
+            return v, f"env:{k}"
 
-            out.append(TranscriptLine(start=start, end=end, speaker=spk, text=text))
-
-        return out
-
-    def _translate_en_to_fr(self, text: str) -> str:
-        if not text.strip():
-            return ""
-        if self._translator_en_fr is None:
-            return ""
+    for ck, cv in (cfg or {}).items():
         try:
-            res = self._translator_en_fr.translate(text)
-            return (res or "").strip()
+            s = str(cv).strip()
         except Exception:
-            return ""
+            continue
+        if _is_pplx_key(s):
+            tried.append(f"cfg:*looks_like_key:{ck}")
+            return s, f"cfg:*looks_like_key:{ck}"
 
-    def _perplexity_summary(self, transcript_text: str) -> str:
-        """
-        Appel Perplexity (best-effort). Si ça échoue, on renvoie "".
-        """
-        if not self.perplexity_api_key.strip():
-            return ""
+    return "", f"not_found; tried={', '.join(tried)}"
 
-        url = "https://api.perplexity.ai/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.perplexity_api_key}",
-            "Content-Type": "application/json",
-        }
 
-        payload = {
-            "model": "sonar",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Tu es un assistant qui résume des réunions en français, clairement et de façon structurée.",
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "Résume cette réunion en français.\n"
-                        "- Points clés\n- Décisions\n- Actions / TODO (avec responsables si possible)\n\n"
-                        f"Transcription:\n{transcript_text}"
-                    ),
-                },
-            ],
-            "temperature": 0.2,
-        }
+def _call_perplexity(api_key: str, prompt: str, model: str, timeout_s: int = DEFAULT_TIMEOUT_S) -> SummaryResult:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+    }
 
+    last_err = ""
+    last_code = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=60)
-            r.raise_for_status()
-            data = r.json()
-            return (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
-        except Exception:
-            return ""
+            r = requests.post(PPLX_URL, headers=headers, json=payload, timeout=timeout_s)
+            last_code = r.status_code
+            if r.status_code == 200:
+                data = r.json()
+                text = ((((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or "").strip()
+                if text:
+                    return SummaryResult(ok=True, text=text, status_code=r.status_code)
+                return SummaryResult(ok=False, error="Réponse Perplexity vide.", status_code=r.status_code)
 
-    def generate_meeting_docx(
-        self,
-        session_dir: Path,
-        transcript_path: Path,
-        title: str = "Résumé de Réunion",
-        meeting_date: Optional[str] = None,
-        participants: str = "N/A",
-    ) -> Path:
-        session_dir = Path(session_dir)
-        transcript_path = Path(transcript_path)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = f"HTTP {r.status_code}: {r.text[:800]}"
+                time.sleep(min(2 ** attempt, 8))
+                continue
 
-        meeting_date = meeting_date or datetime.now().strftime("%d/%m/%Y %H:%M")
+            return SummaryResult(ok=False, error=f"HTTP {r.status_code}: {r.text[:2000]}", status_code=r.status_code)
 
-        doc = Document()
+        except Exception as e:
+            last_err = repr(e)
+            time.sleep(min(2 ** attempt, 8))
 
-        # Title
-        p = doc.add_paragraph()
-        r = p.add_run(title)
-        r.bold = True
-        r.font.size = Pt(20)
-
-        doc.add_paragraph(f"Date: {meeting_date}")
-        doc.add_paragraph(f"Participants: {participants}")
-        doc.add_paragraph("")
-
-        # Transcript bilingual
-        doc.add_heading("Transcription + Traduction (FR)", level=1)
-
-        segs = self._parse_transcript(transcript_path)
-        if not segs:
-            doc.add_paragraph("(Aucune transcription trouvée.)")
-        else:
-            table = doc.add_table(rows=1, cols=4)
-            hdr = table.rows[0].cells
-            hdr[0].text = "Temps"
-            hdr[1].text = "Speaker"
-            hdr[2].text = "Texte"
-            hdr[3].text = "Traduction (FR)"
-
-            # Header bold
-            for c in hdr:
-                for run in c.paragraphs[0].runs:
-                    run.bold = True
-
-            for s in segs:
-                row = table.add_row().cells
-                row[0].text = f"{s.start} - {s.end}"
-                row[1].text = s.speaker
-                row[2].text = s.text
-
-                fr = self._translate_en_to_fr(s.text)
-                row[3].text = fr if fr else "(Traduction indisponible)"
-
-        doc.add_paragraph("")
-
-        # Summary
-        doc.add_heading("Résumé", level=1)
-        transcript_text = transcript_path.read_text(encoding="utf-8", errors="replace")
-        summary = self._perplexity_summary(transcript_text)
-
-        if summary:
-            doc.add_paragraph(summary)
-        else:
-            doc.add_paragraph("Résumé non disponible (clé Perplexity absente ou erreur d'appel).")
-
-        out_path = session_dir / "Résumé de Réunion.docx"
-        doc.save(str(out_path))
-        return out_path
+    return SummaryResult(ok=False, error=last_err or "Erreur inconnue Perplexity.", status_code=last_code)
 
 
-# ---------------------------------------------------------------------
-# ✅ Wrapper attendu par main.py (pour compatibilité)
-# ---------------------------------------------------------------------
-def generate_meeting_docx(transcript_path: Path, session_dir: Path, cfg: dict) -> Path:
-    """
-    Compat main.py :
-    generate_meeting_docx(transcript_path=..., session_dir=..., cfg=...)
-    """
+def generate_meeting_docx(transcript_path: Path, session_dir: Path, cfg: Dict[str, Any]) -> Path:
     transcript_path = Path(transcript_path)
     session_dir = Path(session_dir)
+    session_dir.mkdir(parents=True, exist_ok=True)
 
-    # Récupère la clé Perplexity depuis secure_store si possible
-    perplexity_key = ""
     try:
-        from config.secure_store import getsecret
-        perplexity_key = getsecret(cfg, "perplexity_api_key") or ""
+        transcript_text = transcript_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        transcript_text = f"(Impossible de lire la transcription: {e!r})"
+
+    key, key_src = _get_perplexity_key(cfg or {})
+
+    pplx_err = ""
+    summary_text = ""
+
+    if not bool((cfg or {}).get("postprocess_enable_perplexity_summary", True)):
+        pplx_err = "Résumé Perplexity désactivé dans les réglages."
+    elif not key:
+        pplx_err = f"clé Perplexity absente (source={key_src})"
+    else:
+        model = str((cfg or {}).get("perplexity_model") or DEFAULT_MODEL).strip()
+        template = str((cfg or {}).get("summary_template") or "Compte rendu pro")
+        template_hint = ""
+        if template == "Vidéo YouTube":
+            template_hint = "Le compte rendu doit être adapté à une vidéo YouTube (ton pédagogique, points clés, conclusions)."
+        elif template == "Webinaire":
+            template_hint = "Le compte rendu doit être adapté à un webinaire (structure pédagogique, questions/réponses, points clés)."
+        elif template == "Réunion Discord (asso)":
+            template_hint = "Le compte rendu doit être adapté à une réunion Discord associative (actions concrètes, décisions, suivi)."
+        elif template == "Recrutement":
+            template_hint = "Le compte rendu doit être adapté à un entretien de recrutement (profil, compétences, points forts/faiblesses)."
+        else:
+            template_hint = "Le compte rendu doit être professionnel et synthétique."
+        prompt = (
+            "Tu es un assistant chargé de produire un compte rendu fidèle et exploitable.\n"
+            "Le contexte peut être professionnel ou personnel.\n\n"
+            f"{template_hint}\n\n"
+            "À partir de la transcription ci-dessous, produis STRICTEMENT la structure suivante :\n\n"
+            "=== RÉSUMÉ GLOBAL ===\n"
+            "Synthèse claire de la situation en 5 à 10 lignes.\n\n"
+            "=== POINTS ÉVOQUÉS ===\n"
+            "- Liste factuelle des sujets abordés.\n\n"
+            "=== DÉCISIONS ===\n"
+            "- Décisions prises explicitement (sinon écrire : Aucune décision formalisée).\n\n"
+            "=== ACTIONS À FAIRE ===\n"
+            "- Action | Responsable | Échéance | Priorité\n"
+            "- Si une information est absente, écrire 'Non précisée'.\n\n"
+            "=== DEADLINES / ÉCHÉANCES ===\n"
+            "- Récapitulatif des dates mentionnées (ou 'Aucune').\n\n"
+            "=== RISQUES / POINTS EN SUSPENS ===\n"
+            "- Points non tranchés, ambiguïtés, sujets à clarifier.\n\n"
+            "Règles importantes :\n"
+            "- Ne pas inventer d'informations.\n"
+            "- Être concis, structuré, professionnel.\n"
+            "- Utiliser un français clair.\n\n"
+            "TRANSCRIPTION :\n"
+            f"""{transcript_text}"""
+        )
+        res = _call_perplexity(key.strip(), prompt, model=model)
+        if res.ok:
+            summary_text = res.text.strip()
+        else:
+            pplx_err = res.error or "Erreur inconnue Perplexity."
+
+    if pplx_err:
+        _write_text(session_dir / "perplexity_error.txt", pplx_err)
+
+    doc = Document()
+    doc.add_heading("Résumé de Réunion", level=1)
+    if summary_text:
+        doc.add_paragraph(summary_text)
+    else:
+        doc.add_paragraph("Résumé non disponible (clé Perplexity absente ou erreur d'appel).")
+
+    if bool((cfg or {}).get("postprocess_extract_participants", False)):
+        try:
+            names = extract_participant_names(transcript_path, cfg)
+            if names:
+                doc.add_heading("Participants (IA)", level=2)
+                for line in names.splitlines():
+                    if line.strip():
+                        doc.add_paragraph(line.strip())
+        except Exception:
+            pass
+
+    doc.add_heading("Transcription", level=1)
+    for line in transcript_text.splitlines():
+        if line.strip():
+            doc.add_paragraph(line)
+
+    out_path = session_dir / "Résumé de Réunion.docx"
+    doc.save(str(out_path))
+    return out_path
+
+
+def generate_subject_from_transcript(transcript_path: Path, cfg: Dict[str, Any]) -> str:
+    try:
+        transcript_text = Path(transcript_path).read_text(encoding="utf-8", errors="replace")
     except Exception:
-        perplexity_key = cfg.get("perplexity_api_key", "") or ""
-
-    title = cfg.get("docx_title", "Résumé de Réunion") or "Résumé de Réunion"
-    participants = cfg.get("docx_participants", "N/A") or "N/A"
-
-    service = MeetingSummaryService(perplexity_api_key=perplexity_key)
-    return service.generate_meeting_docx(
-        session_dir=session_dir,
-        transcript_path=transcript_path,
-        title=title,
-        participants=participants,
+        transcript_text = ""
+    key, _ = _get_perplexity_key(cfg or {})
+    if not key or not transcript_text.strip():
+        return ""
+    prompt = (
+        "Tu dois proposer un sujet très court pour une réunion.\n"
+        "Donne uniquement un titre court (4 à 8 mots), sans guillemets.\n\n"
+        "TRANSCRIPTION:\n"
+        f"{transcript_text}"
     )
+    res = _call_perplexity(key.strip(), prompt, model=str((cfg or {}).get("perplexity_model") or DEFAULT_MODEL).strip())
+    if res.ok:
+        return (res.text or "").strip().strip('"')
+    return ""
+
+
+def extract_participant_names(transcript_path: Path, cfg: Dict[str, Any]) -> str:
+    try:
+        transcript_text = Path(transcript_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        transcript_text = ""
+    key, _ = _get_perplexity_key(cfg or {})
+    if not key or not transcript_text.strip():
+        return ""
+    prompt = (
+        "Analyse la transcription et tente d'identifier les noms des participants.\n"
+        "Retourne une liste simple, une ligne par participant (Nom - rôle si possible).\n"
+        "Si aucune info fiable, réponds 'Non précisé'.\n\n"
+        "TRANSCRIPTION:\n"
+        f"{transcript_text}"
+    )
+    res = _call_perplexity(key.strip(), prompt, model=str((cfg or {}).get("perplexity_model") or DEFAULT_MODEL).strip())
+    if res.ok:
+        return (res.text or "").strip()
+    return ""
