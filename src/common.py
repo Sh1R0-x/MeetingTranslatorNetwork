@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-APP_NAME = "MeetingTranslator"
+APP_NAME = "MeetingTranslatorNetwork"
 APP_VERSION = "2026.01"
 DEFAULT_SESSIONS_DIR = Path.home() / "MeetingTranslatorSessions"
 

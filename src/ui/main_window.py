@@ -5,6 +5,7 @@ import os
 import queue
 import re
 import shutil
+import subprocess
 import traceback
 import wave
 import html
@@ -13,6 +14,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import time
+
+try:
+    import sounddevice as sd
+except Exception:  # pragma: no cover - optional at runtime
+    sd = None
 
 from PyQt6.QtCore import QEvent, QTimer, Qt, pyqtSignal, QSize, QThread, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QGuiApplication, QTextCursor, QTextCharFormat, QFont, QColor
@@ -56,7 +62,7 @@ from services.recorder_service import RecorderService
 
 APP_NAME = "MeetingTranslatorNetwork"
 APP_VERSION = "2026"
-DEFAULT_SESSIONS_DIR = str(Path.cwd() / "recordings")
+DEFAULT_SESSIONS_DIR = str((Path.home() / "Documents" / APP_NAME / "recordings"))
 OPENAI_TRANSCRIBE_PER_MIN = 0.006
 ASSEMBLYAI_STREAMING_PER_HOUR = 0.15
 ASSEMBLYAI_STREAMING_PER_MIN = ASSEMBLYAI_STREAMING_PER_HOUR / 60.0
@@ -84,7 +90,8 @@ class LiveMessage:
 class StatusPill(QToolButton):
     def __init__(self, text: str, parent=None):
         super().__init__(parent)
-        self.setText(text)
+        self._base_text = str(text)
+        self.setText(f"{self._base_text} OFF")
         self.setCheckable(True)
         self.setChecked(False)
         self.setProperty("kind", "segment")
@@ -96,6 +103,7 @@ class StatusPill(QToolButton):
         state = str(state or "off")
         self.setProperty("state", state)
         is_on = state in ("ok", "warn")
+        self.setText(f"{self._base_text} {'ON' if is_on else 'OFF'}")
         self.setProperty("selected", "true" if is_on else "false")
         self.setChecked(is_on)
         self.style().polish(self)
@@ -308,12 +316,11 @@ class LiveChatView(QTextBrowser):
         self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
-        # Terminal-like styling (local to this widget only; does not touch the global theme).
         self.setStyleSheet(
             "QTextBrowser#LiveChatView{"
-            "background:#0B0B0B;"
-            "border:1px solid #1A1A1A;"
-            "border-radius:14px;"
+            "background:#0e0e12;"
+            "border:1px solid #2a2a38;"
+            "border-radius:12px;"
             "}"
         )
 
@@ -328,6 +335,7 @@ class LiveChatView(QTextBrowser):
         self._pending_keep_scroll = False
         self._pending_scroll_bottom = False
         self._pending_scroll_value = 0
+        self._session_marker_inserted = False
 
         # Detect user scroll even when they drag the scrollbar.
         bar = self.verticalScrollBar()
@@ -337,18 +345,18 @@ class LiveChatView(QTextBrowser):
         except Exception:
             pass
 
-        # Text formats: monochrome, terminal-like.
+        # Text formats used by minimal fallback rendering.
         self._fmt_meta = QTextCharFormat()
-        self._fmt_meta.setForeground(QColor("#A0A0A0"))
-        meta_font = QFont("IBM Plex Sans")
+        self._fmt_meta.setForeground(QColor("#71717a"))
+        meta_font = QFont("Inter")
         meta_font.setPointSizeF(9.0)
         meta_font.setWeight(QFont.Weight.Medium)
         self._fmt_meta.setFont(meta_font)
 
         self._fmt_body = QTextCharFormat()
-        self._fmt_body.setForeground(QColor("#F2F2F2"))
-        body_font = QFont("IBM Plex Sans")
-        body_font.setPointSizeF(12.0)
+        self._fmt_body.setForeground(QColor("#e2e8f0"))
+        body_font = QFont("Inter")
+        body_font.setPointSizeF(11.0)
         self._fmt_body.setFont(body_font)
 
         # Initialize an empty document.
@@ -367,6 +375,7 @@ class LiveChatView(QTextBrowser):
 
     def clear_messages(self):
         self._messages.clear()
+        self._session_marker_inserted = False
         self.clear()
         self._update_reading_width()
 
@@ -377,6 +386,8 @@ class LiveChatView(QTextBrowser):
         self._messages.append(msg)
 
         # Incremental append is much faster than re-rendering the whole document.
+        if len(self._messages) == 1 and not self._session_marker_inserted:
+            self._append_session_marker(msg)
         self._append_message_to_doc(msg)
 
         if scroll_to_bottom:
@@ -444,6 +455,9 @@ class LiveChatView(QTextBrowser):
             self._update_reading_width()
             cursor = self.textCursor()
             cursor.movePosition(QTextCursor.MoveOperation.End)
+            if self._messages:
+                self._insert_session_marker(cursor, self._messages[0])
+                self._session_marker_inserted = True
             # Limit to keep UI responsive on very long sessions.
             max_render = 2500
             for msg in (self._messages[-max_render:] if len(self._messages) > max_render else self._messages):
@@ -453,23 +467,64 @@ class LiveChatView(QTextBrowser):
             pass
 
     def _insert_one(self, cursor: QTextCursor, msg: LiveMessage):
-        ts = (msg.timestamp or "").strip()
+        ts = html.escape((msg.timestamp or "").strip())
         src = self._normalize_source_label(msg.source)
-        header = f"[{ts}] {src}\n"
-        cursor.insertText(header, self._fmt_meta)
+        src_html = html.escape(src)
 
-        # Terminal style: plain text, no tags/colors; keep both if present.
         parts: list[str] = []
         if (msg.text_en or "").strip():
             parts.append((msg.text_en or "").strip())
         if (msg.text_fr or "").strip():
-            if not parts or (msg.text_fr or "").strip() != parts[-1]:
-                parts.append((msg.text_fr or "").strip())
+            text_fr = (msg.text_fr or "").strip()
+            if not parts or text_fr != parts[-1]:
+                parts.append(text_fr)
         body = "\n".join(parts).strip()
-        if body:
-            cursor.insertText(body + "\n\n", self._fmt_body)
-        else:
-            cursor.insertText("\n", self._fmt_body)
+        if not body:
+            body = "..."
+
+        body_html = html.escape(body).replace("\n", "<br/>")
+        # Speaker color palette
+        speaker_colors = {
+            "MOI": "#0d9af2",
+            "PARTICIPANTS": "#8b5cf6",
+        }
+        source_color = speaker_colors.get(src.upper(), "#8b5cf6")
+        block_html = (
+            "<div style='margin:0 0 18px 0;'>"
+            f"<div style='margin:0 0 6px 0;'>"
+            f"<span style='font-size:10px;color:#52525b;font-family:JetBrains Mono,Consolas,monospace;'>[{ts}]</span> "
+            f"<span style='font-size:11px;color:{source_color};font-weight:700;font-family:Inter,sans-serif;'>{src_html}</span>"
+            f"</div>"
+            "<div style='margin-left:60px;background:#13131a;border:1px solid #2a2a38;border-radius:10px;padding:10px 14px;max-width:920px;'>"
+            f"<span style='font-size:13px;line-height:1.6;color:#e2e8f0;font-family:Inter,sans-serif;'>{body_html}</span>"
+            "</div>"
+            "</div>"
+        )
+        cursor.insertHtml(block_html)
+        cursor.insertBlock()
+
+    def _append_session_marker(self, msg: LiveMessage):
+        try:
+            cursor = self.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self._insert_session_marker(cursor, msg)
+            self.setTextCursor(cursor)
+            self._session_marker_inserted = True
+        except Exception:
+            pass
+
+    def _insert_session_marker(self, cursor: QTextCursor, msg: LiveMessage):
+        ts = html.escape((msg.timestamp or "").strip() or "--:--")
+        marker_html = (
+            "<div style='text-align:center;margin:10px 0 20px 0;'>"
+            "<span style='display:inline-block;background:#13131a;border:1px solid #2a2a38;"
+            "border-radius:999px;padding:6px 16px;font-size:11px;color:#71717a;"
+            "font-family:Inter,sans-serif;font-weight:500;letter-spacing:0.3px;'>"
+            f"Séance démarrée à {ts}"
+            "</span></div>"
+        )
+        cursor.insertHtml(marker_html)
+        cursor.insertBlock()
 
     def _normalize_source_label(self, source: Optional[str]) -> str:
         raw = (source or "").strip()
@@ -517,7 +572,7 @@ class PopoutLiveChatView(QTextBrowser):
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.setStyleSheet(
             "QTextBrowser#PopoutLiveChatView{"
-            "background:#0B0B0B;border:1px solid #1A1A1A;border-radius:12px;"
+            "background:#0e0e12;border:1px solid #2a2a38;border-radius:12px;"
             "}"
         )
 
@@ -529,14 +584,14 @@ class PopoutLiveChatView(QTextBrowser):
         self._pending_scroll_bottom = False
         self._pending_scroll_value = 0
         self._fmt_meta = QTextCharFormat()
-        self._fmt_meta.setForeground(QColor("#A0A0A0"))
-        meta_font = QFont("IBM Plex Sans")
+        self._fmt_meta.setForeground(QColor("#71717a"))
+        meta_font = QFont("Inter")
         meta_font.setPointSizeF(9.0)
         meta_font.setWeight(QFont.Weight.Medium)
         self._fmt_meta.setFont(meta_font)
         self._fmt_body = QTextCharFormat()
-        self._fmt_body.setForeground(QColor("#F2F2F2"))
-        body_font = QFont("IBM Plex Sans")
+        self._fmt_body.setForeground(QColor("#e2e8f0"))
+        body_font = QFont("Inter")
         body_font.setPointSizeF(12.0)
         self._fmt_body.setFont(body_font)
 
@@ -608,9 +663,9 @@ class PopoutLiveChatView(QTextBrowser):
             self._schedule_render(keep_scroll=True, scroll_to_bottom=False)
 
     def _insert_one(self, cursor: QTextCursor, msg: LiveMessage):
-        ts = (msg.timestamp or "").strip()
+        ts = html.escape((msg.timestamp or "").strip())
         src = self._source_label(msg.source)
-        cursor.insertText(f"[{ts}] {src}\n", self._fmt_meta)
+        src_html = html.escape(src)
         text_parts = []
         if (msg.text_en or "").strip():
             text_parts.append((msg.text_en or "").strip())
@@ -619,9 +674,26 @@ class PopoutLiveChatView(QTextBrowser):
             if not text_parts or fr != text_parts[-1]:
                 text_parts.append(fr)
         body = "\n".join(text_parts).strip()
-        if body:
-            cursor.insertText(body + "\n", self._fmt_body)
-        cursor.insertBlock()
+        if not body:
+            body = "..."
+        body_html = html.escape(body).replace("\n", "<br/>")
+        speaker_colors = {
+            "MOI": "#0d9af2",
+            "PARTICIPANTS": "#8b5cf6",
+        }
+        source_color = speaker_colors.get(src.upper(), "#8b5cf6")
+        block_html = (
+            "<div style='margin:0 0 18px 0;'>"
+            f"<div style='margin:0 0 6px 0;'>"
+            f"<span style='font-size:10px;color:#52525b;font-family:JetBrains Mono,Consolas,monospace;'>[{ts}]</span> "
+            f"<span style='font-size:11px;color:{source_color};font-weight:700;font-family:Inter,sans-serif;'>{src_html}</span>"
+            f"</div>"
+            "<div style='margin-left:60px;background:#13131a;border:1px solid #2a2a38;border-radius:10px;padding:10px 14px;max-width:980px;'>"
+            f"<span style='font-size:13px;line-height:1.6;color:#e2e8f0;font-family:Inter,sans-serif;'>{body_html}</span>"
+            "</div>"
+            "</div>"
+        )
+        cursor.insertHtml(block_html)
         cursor.insertBlock()
 
     def _source_label(self, source: Optional[str]) -> str:
@@ -677,7 +749,6 @@ class TopBar(QWidget):
     start_clicked = pyqtSignal()
     pause_clicked = pyqtSignal()
     stop_clicked = pyqtSignal()
-    test_audio_clicked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -690,49 +761,7 @@ class TopBar(QWidget):
         root.setSpacing(10)
 
         left = QHBoxLayout()
-        left.setSpacing(8)
-        self.btn_start = PulseButton("Démarrer")
-        self.btn_start.setObjectName("BtnStart")
-        self.btn_start.setProperty("variant", "primary")
-        self.btn_start.setProperty("tone", "success")
-        self.btn_pause = PulseButton("Pause")
-        self.btn_pause.setObjectName("BtnPause")
-        self.btn_pause.setProperty("variant", "ghost")
-        self.btn_pause.setProperty("tone", "warning")
-        self.btn_stop = PulseButton("Arrêter")
-        self.btn_stop.setObjectName("BtnStop")
-        self.btn_stop.setProperty("variant", "ghost")
-        self.btn_stop.setProperty("tone", "danger")
-        self.btn_test = PulseButton("Test Audio")
-        self.btn_test.setObjectName("BtnTest")
-        self.btn_test.setProperty("variant", "ghost")
-        self.btn_test.setProperty("tone", "info")
-        self.btn_reset = PulseButton("Reset")
-        self.btn_reset.setObjectName("BtnReset")
-        self.btn_reset.setProperty("variant", "ghost")
-        self.btn_reset.setProperty("tone", "neutral")
-        self.btn_pause.setEnabled(False)
-        self.btn_stop.setEnabled(False)
-        left.addWidget(self.btn_start)
-        left.addWidget(self.btn_pause)
-        left.addWidget(self.btn_stop)
-        left.addWidget(self.btn_test)
-        left.addWidget(self.btn_reset)
-
-        # Uniform button sizes for a cleaner top bar.
-        widths = [
-            self.btn_start.sizeHint().width(),
-            self.btn_pause.sizeHint().width(),
-            self.btn_stop.sizeHint().width(),
-            self.btn_test.sizeHint().width(),
-            self.btn_reset.sizeHint().width(),
-        ]
-        target_w = max(widths) + 6
-        for b in (self.btn_start, self.btn_pause, self.btn_stop, self.btn_test, self.btn_reset):
-            b.setFixedWidth(target_w)
-
-        root.addLayout(left)
-        root.addStretch(1)
+        left.setSpacing(10)
 
         self.timer_badge = QFrame()
         self.timer_badge.setObjectName("TimerBadge")
@@ -746,7 +775,36 @@ class TopBar(QWidget):
         self.lbl_timer.setObjectName("TopBarTimer")
         badge_layout.addWidget(self.lbl_rec)
         badge_layout.addWidget(self.lbl_timer)
-        root.addWidget(self.timer_badge, alignment=Qt.AlignmentFlag.AlignCenter)
+        left.addWidget(self.timer_badge)
+
+        divider = QFrame()
+        divider.setObjectName("TopDivider")
+        divider.setFixedSize(1, 30)
+        left.addWidget(divider)
+
+        self.btn_start = PulseButton("Démarrer")
+        self.btn_start.setObjectName("BtnStart")
+        self.btn_start.setProperty("variant", "primary")
+        self.btn_start.setProperty("tone", "success")
+        self.btn_pause = PulseButton("Pause")
+        self.btn_pause.setObjectName("BtnPause")
+        self.btn_pause.setProperty("variant", "ghost")
+        self.btn_pause.setProperty("tone", "warning")
+        self.btn_stop = PulseButton("Arrêter")
+        self.btn_stop.setObjectName("BtnStop")
+        self.btn_stop.setProperty("variant", "ghost")
+        self.btn_stop.setProperty("tone", "danger")
+        self.btn_reset = PulseButton("Reset")
+        self.btn_reset.setObjectName("BtnReset")
+        self.btn_reset.setProperty("variant", "ghost")
+        self.btn_reset.setProperty("tone", "neutral")
+        self.btn_pause.setEnabled(False)
+        self.btn_stop.setEnabled(False)
+        left.addWidget(self.btn_start)
+        left.addWidget(self.btn_pause)
+        left.addWidget(self.btn_stop)
+        left.addWidget(self.btn_reset)
+        root.addLayout(left)
         root.addStretch(1)
 
         # Subtle recording animation (pulsing REC) for better affordance.
@@ -793,7 +851,6 @@ class TopBar(QWidget):
         self.btn_start.clicked.connect(self.start_clicked)
         self.btn_pause.clicked.connect(self.pause_clicked)
         self.btn_stop.clicked.connect(self.stop_clicked)
-        self.btn_test.clicked.connect(self.test_audio_clicked)
 
     def set_recording(self, recording: bool):
         """
@@ -829,37 +886,86 @@ class LiveTab(QWidget):
         layout.setSpacing(8)
 
         top_actions = QHBoxLayout()
-        top_actions.setSpacing(10)
+        top_actions.setSpacing(12)
         self.btn_lang_participants = QToolButton()
         self.btn_lang_participants.setObjectName("LiveOptionsButton")
         self.btn_lang_participants.setProperty("variant", "ghost")
-        self.btn_lang_participants.setText("Langue du participant: Auto")
+        self.btn_lang_participants.setText("Auto")
+        self.btn_lang_participants.setMinimumWidth(220)
+        self.btn_lang_participants.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.btn_lang_participants.setToolTip("Langue du participant")
         self.btn_lang_participants.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+
         self.btn_lang_me = QToolButton()
         self.btn_lang_me.setObjectName("LiveOptionsButton")
         self.btn_lang_me.setProperty("variant", "ghost")
-        self.btn_lang_me.setText("Ma langue source: Auto")
+        self.btn_lang_me.setText("Auto")
+        self.btn_lang_me.setMinimumWidth(220)
+        self.btn_lang_me.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.btn_lang_me.setToolTip("Ma langue source")
         self.btn_lang_me.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+
+        lang_part_wrap = QFrame()
+        lang_part_wrap.setObjectName("LiveLangWrap")
+        lang_part_layout = QVBoxLayout(lang_part_wrap)
+        lang_part_layout.setContentsMargins(0, 0, 0, 0)
+        lang_part_layout.setSpacing(4)
+        lbl_part = QLabel("LANGUE DU PARTICIPANT")
+        lbl_part.setObjectName("LiveOptionLabel")
+        lang_part_layout.addWidget(lbl_part)
+        lang_part_layout.addWidget(self.btn_lang_participants)
+
+        arrow_lbl = QLabel("→")
+        arrow_lbl.setObjectName("LiveArrow")
+        arrow_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        lang_me_wrap = QFrame()
+        lang_me_wrap.setObjectName("LiveLangWrap")
+        lang_me_layout = QVBoxLayout(lang_me_wrap)
+        lang_me_layout.setContentsMargins(0, 0, 0, 0)
+        lang_me_layout.setSpacing(4)
+        lbl_me = QLabel("MA LANGUE SOURCE")
+        lbl_me.setObjectName("LiveOptionLabel")
+        lang_me_layout.addWidget(lbl_me)
+        lang_me_layout.addWidget(self.btn_lang_me)
+
         self.chk_autoscroll = QCheckBox("Auto-scroll")
         self.chk_autoscroll.setChecked(True)
         self.chk_live_enabled = QCheckBox("Live")
         self.chk_live_enabled.setChecked(True)
         self.btn_popout = QToolButton()
-        self.btn_popout.setText("Ouvrir chat")
-        self.btn_popout.setProperty("variant", "ghost")
+        self.btn_popout.setText("💬  Ouvrir chat")
+        self.btn_popout.setObjectName("LiveActionPrimary")
+        self.btn_popout.setProperty("variant", "primary")
         self.btn_rename_speaker = QToolButton()
-        self.btn_rename_speaker.setText("Renommer voix")
+        self.btn_rename_speaker.setText("✎  Renommer voix")
+        self.btn_rename_speaker.setObjectName("LiveActionSecondary")
         self.btn_rename_speaker.setProperty("variant", "ghost")
-        top_actions.addWidget(self.btn_lang_participants)
-        top_actions.addWidget(self.btn_lang_me)
-        top_actions.addWidget(self.chk_autoscroll)
-        top_actions.addWidget(self.chk_live_enabled)
+
+        top_actions.addWidget(lang_part_wrap)
+        top_actions.addWidget(arrow_lbl)
+        top_actions.addWidget(lang_me_wrap)
+        top_actions.addStretch(1)
         top_actions.addWidget(self.btn_popout)
         top_actions.addWidget(self.btn_rename_speaker)
-        top_actions.addStretch(1)
         layout.addLayout(top_actions)
+
+        self.preview_header = QFrame()
+        self.preview_header.setObjectName("LivePreviewHeader")
+        preview_layout = QHBoxLayout(self.preview_header)
+        preview_layout.setContentsMargins(12, 8, 12, 8)
+        preview_layout.setSpacing(8)
+        self.lbl_preview_title = QLabel("CHAT LIVE PREVIEW")
+        self.lbl_preview_title.setObjectName("LivePreviewTitle")
+        self.lbl_preview_title.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        preview_layout.addWidget(self.lbl_preview_title)
+        preview_layout.addStretch(1)
+        self.btn_preview_history = QToolButton()
+        self.btn_preview_history.setObjectName("LivePreviewHistory")
+        self.btn_preview_history.setText("↺")
+        self.btn_preview_history.setProperty("variant", "ghost")
+        preview_layout.addWidget(self.btn_preview_history)
+        layout.addWidget(self.preview_header)
 
         self.chat = LiveChatView()
         layout.addWidget(self.chat, 1)
@@ -869,7 +975,12 @@ class LiveTab(QWidget):
         self.btn_scroll_bottom.setVisible(False)
         self.btn_scroll_bottom.setObjectName("ScrollBottomButton")
         self.btn_scroll_bottom.setProperty("variant", "ghost")
-        layout.addWidget(self.btn_scroll_bottom, alignment=Qt.AlignmentFlag.AlignRight)
+
+        bottom_actions = QHBoxLayout()
+        bottom_actions.setSpacing(10)
+        bottom_actions.addStretch(1)
+        bottom_actions.addWidget(self.btn_scroll_bottom)
+        layout.addLayout(bottom_actions)
 
         self.cmb_speaker_filter = QComboBox()
         self.cmb_speaker_filter.addItem("Tous")
@@ -1148,23 +1259,7 @@ class MainWindow(QMainWindow):
         self.cfg = load_config()
 
         self.live_queue = queue.Queue(maxsize=300)
-
-        po = self.cfg.get("participantsoutputdeviceid", None)
-        mi = self.cfg.get("microdeviceid", None)
-        if po is None or mi is None:
-            raise RuntimeError(
-                "Configuration audio manquante : ouvre Configuration et sélectionne "
-                "la sortie Windows (participants) et le micro."
-            )
-
-        sessions_dir = Path(self.cfg.get("sessions_dir") or DEFAULT_SESSIONS_DIR)
-        sessions_dir.mkdir(parents=True, exist_ok=True)
-
-        self.recorder = RecorderService(
-            participants_output_device_id=int(po),
-            mic_device_id=int(mi),
-            output_root=sessions_dir,
-        )
+        self.recorder = self._build_recorder_from_cfg()
 
         self._configure_live_source_queue()
 
@@ -1217,6 +1312,158 @@ class MainWindow(QMainWindow):
         self.price_timer.setInterval(30000)
         self.price_timer.timeout.connect(self._update_price_estimate)
 
+    def _parse_cfg_device_id(self, key: str) -> Optional[int]:
+        raw = self.cfg.get(key, None)
+        if raw is None:
+            return None
+        try:
+            val = int(raw)
+        except Exception:
+            return None
+        return val if val >= 0 else None
+
+    def _non_windows_audio_defaults(self) -> Optional[tuple[int, int]]:
+        """
+        On macOS/Linux, both "participants" and "micro" are input devices.
+        Participants should ideally be a virtual loopback input (BlackHole/Loopback/Soundflower).
+        """
+        if sd is None:
+            return None
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            return None
+
+        inputs: list[tuple[int, str]] = []
+        for idx, dev in enumerate(devices):
+            try:
+                if int(dev.get("max_input_channels", 0) or 0) > 0:
+                    inputs.append((int(idx), str(dev.get("name", ""))))
+            except Exception:
+                continue
+
+        if not inputs:
+            return None
+
+        valid_ids = {idx for idx, _ in inputs}
+        default_in = None
+        try:
+            dflt = sd.default.device
+            if isinstance(dflt, (list, tuple)):
+                default_in = int(dflt[0]) if dflt else None
+            else:
+                default_in = int(dflt)
+        except Exception:
+            default_in = None
+
+        if default_in not in valid_ids:
+            default_in = inputs[0][0]
+
+        # Prefer known virtual loopback names for participants.
+        loopback_words = (
+            "blackhole",
+            "loopback",
+            "soundflower",
+            "vb-cable",
+            "stereo mix",
+            "monitor",
+            "virtual",
+        )
+        participants_id = None
+        for idx, name in inputs:
+            low = name.lower()
+            if any(k in low for k in loopback_words):
+                participants_id = idx
+                break
+
+        if participants_id is None:
+            # Fallback to another input if available, else same as mic.
+            participants_id = default_in
+            for idx, _name in inputs:
+                if idx != default_in:
+                    participants_id = idx
+                    break
+
+        return int(participants_id), int(default_in)
+
+    def _resolve_audio_devices_from_cfg(self) -> tuple[int, int]:
+        part_id = self._parse_cfg_device_id("participantsoutputdeviceid")
+        mic_id = self._parse_cfg_device_id("microdeviceid")
+
+        if part_id is not None and mic_id is not None:
+            return int(part_id), int(mic_id)
+
+        if os.name == "nt":
+            raise RuntimeError(
+                "Configuration audio manquante : ouvre Configuration et sélectionne "
+                "la sortie Windows (participants) et le micro."
+            )
+
+        detected = self._non_windows_audio_defaults()
+        if not detected:
+            raise RuntimeError(
+                "Aucune source audio d'entrée détectée. Sur macOS, installe BlackHole/Loopback "
+                "puis configure 'Sortie audio' et 'Entrée audio' dans Configuration."
+            )
+
+        part_id, mic_id = detected
+        self.cfg["participantsoutputdeviceid"] = int(part_id)
+        self.cfg["microdeviceid"] = int(mic_id)
+        save_config(self.cfg)
+        return int(part_id), int(mic_id)
+
+    def _build_recorder_from_cfg(self) -> RecorderService:
+        part_id, mic_id = self._resolve_audio_devices_from_cfg()
+        configured_dir = self.cfg.get("sessions_dir") or DEFAULT_SESSIONS_DIR
+        sessions_dir = self._resolve_sessions_dir(configured_dir)
+        return RecorderService(
+            participants_output_device_id=int(part_id),
+            mic_device_id=int(mic_id),
+            output_root=sessions_dir,
+        )
+
+    def _default_sessions_dir(self) -> Path:
+        docs = Path.home() / "Documents"
+        base = docs if docs.exists() else Path.home()
+        return base / APP_NAME / "recordings"
+
+    def _is_writable_dir(self, path: Path) -> bool:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".write_test.tmp"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return True
+        except Exception:
+            return False
+
+    def _resolve_sessions_dir(self, configured_dir) -> Path:
+        configured = Path(str(configured_dir)) if configured_dir else self._default_sessions_dir()
+        fallback = self._default_sessions_dir()
+        for candidate in (configured, fallback):
+            if self._is_writable_dir(candidate):
+                final_dir = candidate
+                break
+        else:
+            raise RuntimeError(
+                "Impossible d'écrire dans le dossier des sessions. "
+                "Choisis un dossier utilisateur dans la configuration."
+            )
+
+        final_str = str(final_dir)
+        if str(self.cfg.get("sessions_dir") or "") != final_str:
+            self.cfg["sessions_dir"] = final_str
+            save_config(self.cfg)
+            if str(configured) != final_str:
+                log_line(f"[SESSIONS] Fallback dossier sessions: {final_str}")
+        return final_dir
+
+    def _reload_recorder_from_cfg(self) -> None:
+        if bool(getattr(getattr(self, "recorder", None), "_running", False)):
+            return
+        self.recorder = self._build_recorder_from_cfg()
+        self._configure_live_source_queue()
+
 
     def _build_ui(self):
         root = QWidget()
@@ -1248,16 +1495,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(tabs_wrap, 1)
 
         self.live_tab = LiveTab()
-        self.tabs.addTab(self.live_tab, "Live")
+        self.tabs.addTab(self.live_tab, "LIVE")
 
         self.transcription_tab = self._build_transcription_tab()
-        self.tabs.addTab(self.transcription_tab, "Transcription")
+        self.tabs.addTab(self.transcription_tab, "TRANSCRIPTION")
 
         self.summary_tab = self._build_summary_tab()
-        self.tabs.addTab(self.summary_tab, "Résumé")
+        self.tabs.addTab(self.summary_tab, "RÉSUMÉ")
 
         self.history_tab = self._build_history_tab()
-        self.tabs.addTab(self.history_tab, "Historique")
+        self.tabs.addTab(self.history_tab, "HISTORIQUE")
 
         self.pp_progress = QProgressBar()
         self.pp_progress.setRange(0, 100)
@@ -1290,6 +1537,12 @@ class MainWindow(QMainWindow):
         bottom_l = QHBoxLayout(bottom)
         bottom_l.setContentsMargins(12, 6, 12, 6)
         bottom_l.setSpacing(8)
+        bottom_l.addWidget(self.live_tab.chk_autoscroll)
+        bottom_l.addWidget(self.live_tab.chk_live_enabled)
+        sep = QFrame()
+        sep.setObjectName("BottomDivider")
+        sep.setFixedSize(1, 16)
+        bottom_l.addWidget(sep)
         self.lbl_price = QLabel("Prix transcription: OpenAI 0,00 $ | Deepgram 0,00 $")
         self.lbl_price.setObjectName("PriceLabel")
         self.lbl_price.setToolTip("Tarifs indicatifs en USD (mise à jour toutes les 30s).")
@@ -1305,7 +1558,6 @@ class MainWindow(QMainWindow):
         self.topbar.start_clicked.connect(self._on_start)
         self.topbar.stop_clicked.connect(self._on_stop)
         self.topbar.pause_clicked.connect(self._on_pause)
-        self.topbar.test_audio_clicked.connect(self._on_test_audio)
         self.topbar.btn_reset.clicked.connect(self._on_reset)
         self.topbar.btn_settings.clicked.connect(self._on_settings)
 
@@ -1842,16 +2094,28 @@ class MainWindow(QMainWindow):
     def _open_current_docx(self):
         if not self._current_docx:
             return
-        try:
-            os.startfile(str(self._current_docx))
-        except Exception:
+        if not self._open_path(self._current_docx):
             QMessageBox.warning(self, "DOCX", "Impossible d'ouvrir le fichier DOCX.")
 
     def _open_folder(self, session_dir: Path):
-        try:
-            os.startfile(str(session_dir))
-        except Exception:
+        if not self._open_path(session_dir):
             QMessageBox.warning(self, "Dossier", "Impossible d'ouvrir le dossier.")
+
+    def _open_path(self, path: Path) -> bool:
+        try:
+            p = str(Path(path))
+            if os.name == "nt":
+                os.startfile(p)
+                return True
+            if os.name == "posix":
+                if "darwin" in (os.uname().sysname or "").lower():
+                    subprocess.Popen(["open", p])
+                else:
+                    subprocess.Popen(["xdg-open", p])
+                return True
+        except Exception:
+            return False
+        return False
 
     def _on_history_item_changed(self, item: QTableWidgetItem):
         if self._history_loading:
@@ -2415,6 +2679,10 @@ class MainWindow(QMainWindow):
         dlg = SetupWindow(start_page="AUDIO")
         dlg.exec()
         self.cfg = load_config()
+        try:
+            self._reload_recorder_from_cfg()
+        except Exception as e:
+            QMessageBox.warning(self, "Configuration audio", str(e))
         self._apply_cfg_to_ui()
 
     def _on_settings(self):
@@ -2423,6 +2691,10 @@ class MainWindow(QMainWindow):
         dlg = SetupWindow(start_page="TRANSCRIPTION")
         dlg.exec()
         self.cfg = load_config()
+        try:
+            self._reload_recorder_from_cfg()
+        except Exception as e:
+            QMessageBox.warning(self, "Configuration audio", str(e))
         self._apply_cfg_to_ui()
 
     def _on_live_enabled_changed(self):
@@ -2567,17 +2839,17 @@ class MainWindow(QMainWindow):
             part_lang = str(self.cfg.get("live_participant_language") or self.cfg.get("live_source_language") or "AUTO").upper()
         if my_lang is None:
             my_lang = str(self.cfg.get("live_my_language") or self.cfg.get("live_source_language") or "AUTO").upper()
-        self.live_tab.btn_lang_participants.setText(f"Langue du participant: {self._lang_label(part_lang)}")
+        self.live_tab.btn_lang_participants.setText(self._lang_label(part_lang))
         self.live_tab.btn_lang_participants.setToolTip("Langue du participant")
-        self.live_tab.btn_lang_me.setText(f"Ma langue source: {self._lang_label(my_lang)}")
+        self.live_tab.btn_lang_me.setText(self._lang_label(my_lang))
         self.live_tab.btn_lang_me.setToolTip("Ma langue source")
 
     def _lang_label(self, code: str) -> str:
         code = (code or "").upper()
         if code == "FR":
-            return "Francais"
+            return "Français (FR)"
         if code == "EN":
-            return "Anglais"
+            return "Anglais (US)"
         return "Auto"
 
     def _sync_live_language_from_source(self) -> bool:

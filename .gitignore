@@ -5,9 +5,16 @@ recordings/
 *.wav
 src/debug_runtime.log
 src/config.json
+build/
+dist/
+artifacts/
+*.spec
 
 # Local debug/temp artifacts
 *_err*.txt
 *_out*.txt
 src/debug_deepgram_url.py
 test_deepgram_*.py
+
+# Internal dev archives
+.archives/

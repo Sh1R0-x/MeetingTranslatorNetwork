@@ -4,6 +4,7 @@ import queue
 import re
 import threading
 import wave
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -174,6 +175,7 @@ class RecorderService:
 
         self._pa: Optional[pyaudio.PyAudio] = None
         self._pa_stream = None
+        self._sd_stream_participants: Optional[sd.InputStream] = None
         self._sd_stream: Optional[sd.InputStream] = None
 
         self.session_dir: Optional[Path] = None
@@ -208,12 +210,6 @@ class RecorderService:
         if self._running:
             return
 
-        if pyaudio is None:
-            raise RuntimeError(
-                "Capture participants (WASAPI loopback) indisponible sur cette plateforme. "
-                "Utilise la version Windows pour l'enregistrement multi-pistes."
-            )
-
         now = datetime.now()
         date_dir = _date_folder_name(now)
         time_prefix = _time_prefix(now)
@@ -222,13 +218,26 @@ class RecorderService:
         self.session_dir = self.output_root / date_dir / time_prefix
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
-        # -------- Participants (loopback) --------
-        lb = get_loopback_for_output(self.participants_output_device_id)
-        if not lb:
-            raise RuntimeError("Loopback introuvable pour la sortie sélectionnée (participants).")
+        # -------- Participants --------
+        use_wasapi_loopback = bool(sys.platform.startswith("win") and pyaudio is not None)
+        lb = None
+        if use_wasapi_loopback:
+            lb = get_loopback_for_output(self.participants_output_device_id)
+            use_wasapi_loopback = lb is not None
 
-        part_rate = int(lb["defaultSampleRate"])
-        part_channels = int(lb.get("maxInputChannels", 2) or 2)
+        if use_wasapi_loopback:
+            part_rate = int(lb["defaultSampleRate"])
+            part_channels = int(lb.get("maxInputChannels", 2) or 2)
+        else:
+            if int(self.participants_output_device_id) < 0:
+                raise RuntimeError(
+                    "Source participants invalide. Sur macOS, sélectionne une source d'entrée "
+                    "(ex: BlackHole/Loopback) dans Configuration."
+                )
+            pdev = sd.query_devices(self.participants_output_device_id, "input")
+            part_rate = int(pdev["default_samplerate"])
+            part_channels = int(pdev.get("max_input_channels", 1) or 1)
+            part_channels = max(1, min(part_channels, 2))
 
         self.participants_rate = part_rate
         self.participants_channels = part_channels
@@ -245,33 +254,62 @@ class RecorderService:
         self._t_part = threading.Thread(target=self._writer_loop_participants, daemon=True)
         self._t_part.start()
 
-        self._pa = pyaudio.PyAudio()
+        if use_wasapi_loopback:
+            self._pa = pyaudio.PyAudio()
 
-        def cb_part(in_data, frame_count, time_info, status):
-            try:
-                if in_data:
-                    frames_i = int(frame_count)
-                    self._q_part.put((in_data, frames_i))
+            def cb_part(in_data, frame_count, time_info, status):
+                try:
+                    if in_data:
+                        frames_i = int(frame_count)
+                        self._q_part.put((in_data, frames_i))
 
+                        if self._q_live_part is not None:
+                            try:
+                                self._q_live_part.put_nowait((in_data, frames_i))
+                            except queue.Full:
+                                pass
+                except Exception:
+                    pass
+                return (in_data, pyaudio.paContinue)
+
+            self._pa_stream = self._pa.open(
+                format=pyaudio.paInt16,
+                channels=part_channels,
+                rate=part_rate,
+                input=True,
+                input_device_index=int(lb["index"]),
+                frames_per_buffer=1024,
+                stream_callback=cb_part,
+            )
+            self._pa_stream.start_stream()
+        else:
+            def cb_part_sd(indata, frames, time_info, status):
+                try:
+                    data = np.asarray(indata)
+                    if data.ndim == 1:
+                        data = data.reshape(-1, 1)
+                    i16 = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
+                    raw = i16.tobytes()
+                    f = int(frames)
+                    self._q_part.put((raw, f))
                     if self._q_live_part is not None:
                         try:
-                            self._q_live_part.put_nowait((in_data, frames_i))
+                            self._q_live_part.put_nowait((raw, f))
                         except queue.Full:
                             pass
-            except Exception:
-                pass
-            return (in_data, pyaudio.paContinue)
+                except Exception:
+                    pass
 
-        self._pa_stream = self._pa.open(
-            format=pyaudio.paInt16,
-            channels=part_channels,
-            rate=part_rate,
-            input=True,
-            input_device_index=int(lb["index"]),
-            frames_per_buffer=1024,
-            stream_callback=cb_part,
-        )
-        self._pa_stream.start_stream()
+            self._sd_stream_participants = sd.InputStream(
+                device=self.participants_output_device_id,
+                channels=part_channels,
+                samplerate=part_rate,
+                blocksize=1024,
+                latency="high",
+                dtype="float32",
+                callback=cb_part_sd,
+            )
+            self._sd_stream_participants.start()
 
         # -------- Micro (sounddevice) --------
         mic_dev = sd.query_devices(self.mic_device_id, "input")
@@ -369,6 +407,20 @@ class RecorderService:
             print("[Recorder.stop] mic: stop/close done")
         else:
             print("[Recorder.stop] mic: no stream")
+
+        # ---- Stop participants sounddevice stream (macOS/portable fallback) ----
+        if self._sd_stream_participants is not None:
+            s = self._sd_stream_participants
+            print("[Recorder.stop] participants(sd): stop/close start")
+            if hasattr(s, "abort"):
+                _call_with_timeout(lambda: s.abort(), 2.0, "sd_participants.abort")
+            else:
+                _call_with_timeout(lambda: s.stop(), 2.0, "sd_participants.stop")
+            _call_with_timeout(lambda: s.close(), 2.0, "sd_participants.close")
+            self._sd_stream_participants = None
+            print("[Recorder.stop] participants(sd): stop/close done")
+        else:
+            print("[Recorder.stop] participants(sd): no stream")
 
         # ---- Stop pyaudio loopback ----
         if self._pa_stream is not None:

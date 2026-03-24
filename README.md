@@ -1,140 +1,159 @@
 # MeetingTranslatorNetwork
 
-Application desktop Windows pour l'enregistrement de réunions, la transcription live, puis la génération d'un compte rendu structuré en post-traitement.
+Desktop application for meeting recording, live transcription, and structured post-meeting report generation.
 
-## État du projet
-- Statut: production utilisable
-- UI: PyQt6
-- Live: Deepgram ou AssemblyAI
-- Post-traitement: faster-whisper + génération DOCX + résumé Perplexity (optionnel)
+[Lire en français](README.fr.md)
 
-## Fonctionnalités principales
-- Enregistrement audio multi-pistes:
-  - `Audio des participants` (loopback Windows)
-  - `Mon audio` (micro)
-- Transcription live:
-  - moteur configurable (`deepgram` ou `assemblyai`)
-  - option de traduction live EN -> FR
-- Identification voix:
-  - mode recommandé: fiable en compte rendu
-  - mode live beta: labels speaker en direct (moins fiable)
-- Post-traitement isolé dans un sous-processus Python:
-  - évite les crashs UI liés aux libs natives ML
-- Génération de compte rendu DOCX avec template
-- Historique des sessions et réouverture depuis l'application
+## Status
 
-## Architecture (résumé)
+- **Production-ready** (v2026.01)
+- Desktop UI: PyQt6
+- Live transcription: Deepgram or AssemblyAI
+- Post-processing: faster-whisper + DOCX generation + optional Perplexity summary
 
-- `src/app.py`:
-  - point d'entrée application
-  - chargement des polices locales
-- `src/ui/main_window.py`:
-  - fenêtre principale, workflow enregistrement/live/stop/post-process
-- `src/ui/setup_window.py`:
-  - configuration audio, API, options live/post-traitement
-- `src/services/recorder_service.py`:
-  - capture audio participants + micro
-- `src/threads/live_deepgram_thread.py`:
-  - transcription live Deepgram
-- `src/threads/live_assemblyai_thread.py`:
-  - transcription live AssemblyAI
-- `src/threads/postprocess_thread.py`:
-  - orchestration post-traitement (worker séparé)
-- `src/workers/postprocess_worker.py`:
-  - worker de traitement isolé (transcription/diarization/docx)
-- `src/services/postprocess_service.py`:
-  - pipeline post-réunion
-- `src/services/meeting_summary_service.py`:
-  - résumé structuré / DOCX
+## Features
 
-## Workflow
+- **Multi-track audio recording**
+  - Participant audio (Windows loopback / macOS virtual input)
+  - User microphone
+- **Live transcription**
+  - Configurable engine: Deepgram (Nova-3) or AssemblyAI
+  - Optional live EN → FR translation (OpenAI)
+- **Speaker identification**
+  - Recommended mode: reliable speaker labels in post-processing report
+  - Beta mode: live speaker labels (less reliable)
+- **Isolated post-processing** in a separate Python subprocess (prevents UI crashes from native ML libraries)
+- **DOCX report generation** with structured templates
+- **Optional AI summary** via Perplexity API (multiple templates: professional, webinar, recruitment, etc.)
+- **Session history** with re-open capability
 
-1. Démarrer l'enregistrement
-2. Suivre la transcription live dans l'onglet Live (ou fenêtre chat dédiée)
-3. Arrêter
-4. Choisir les options de traitement
-5. Génération transcription + compte rendu
-6. Consulter dans l'onglet Historique ou dans le dossier session
+## Prerequisites
 
-## Prérequis
-- Windows 10/11
+- Windows 10/11 or macOS 13+
 - Python 3.11+
-- Périphériques audio correctement configurés (sortie Windows + micro)
+- Properly configured audio devices:
+  - **Windows**: Audio output (loopback) + Audio input (microphone)
+  - **macOS**: Two inputs (Participant source + Microphone), ideally using BlackHole or Loopback for participant capture
+
+### API Keys (configured in-app)
+
+| Service | Purpose | Required |
+|---------|---------|----------|
+| Deepgram | Live transcription (if selected) | Conditional |
+| AssemblyAI | Live transcription (if selected) | Conditional |
+| OpenAI | Live EN→FR translation | Optional |
+| HuggingFace | Speaker diarization (pyannote models) | Optional |
+| Perplexity | AI-powered meeting summaries | Optional |
 
 ## Installation
 
-```powershell
+```bash
 git clone https://github.com/Sh1R0-x/MeetingTranslatorNetwork.git
 cd MeetingTranslatorNetwork
 python -m venv venv
+# Windows
 venv\Scripts\activate
+# macOS / Linux
+source venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
-## Build V1 (Windows / macOS)
+## Usage
 
-- Windows (EXE + installateur Inno Setup si installé):
+### Launch
+
+```bash
+# Windows
+venv\Scripts\python.exe src\main.py
+
+# macOS / Linux
+venv/bin/python src/main.py
+```
+
+### Initial Configuration
+
+Open **Configuration** in the app:
+
+1. **Audio**: Select participant output device and microphone input device
+2. **API Keys**: Enter the API keys for your chosen services
+3. **Transcription**: Select live engine and speaker identification mode
+
+### Workflow
+
+1. Start recording
+2. Follow live transcription in the Live tab (or dedicated chat window)
+3. Stop recording
+4. Choose post-processing options
+5. Report generation: transcription + structured summary
+6. View results in the History tab or session folder
+
+## Output
+
+Sessions are saved to:
+- **Windows**: `%USERPROFILE%\MeetingTranslatorSessions\`
+- **macOS/Linux**: `~/MeetingTranslatorSessions/`
+
+The output directory can be changed in configuration.
+
+Each session contains:
+- WAV files (participant + microphone tracks)
+- Transcription files
+- Processing logs
+- DOCX report (if enabled)
+
+## Building
+
+### Windows (EXE + optional Inno Setup installer)
+
 ```powershell
 .\scripts\build_windows.ps1
 ```
 
-- macOS (bundle `.app`, DMG si `create-dmg` est installé):
+Output in `artifacts/windows/`:
+- `dist/MeetingTranslatorNetwork/` — standalone executable
+- `installer/` — Inno Setup installer (if Inno Setup is installed)
+
+See [assets/branding/README_BRANDING.txt](assets/branding/README_BRANDING.txt) for custom icons and branding.
+
+### macOS (.app bundle, optional DMG)
+
 ```bash
 chmod +x scripts/build_macos.sh
 ./scripts/build_macos.sh
 ```
 
-- CI GitHub:
-  - Workflow: `.github/workflows/build-v1.yml`
-  - Déclenchement: tag `v*` ou manuel (`workflow_dispatch`)
+### CI/CD
 
-## Lancement
+GitHub Actions workflow: `.github/workflows/build-v1.yml`
+- Triggers on `v*` tags or manual dispatch
+- Builds Windows and macOS artifacts
 
-```powershell
-venv\Scripts\python.exe src\main.py
-```
+## Security
 
-## Configuration initiale
+- API keys are stored using OS-native secure storage (`keyring` / Credential Manager / Keychain)
+- Windows fallback: DPAPI-encrypted storage when keyring backend is unavailable
+- No plaintext credentials are stored in configuration files
+- See [SECURITY.md](SECURITY.md) for more details
 
-Dans `Configuration`:
+## Architecture
 
-- AUDIO:
-  - sélectionner `Sortie audio` (participants)
-  - sélectionner `Entrée audio` (micro)
-- API:
-  - `Deepgram API Key` (si moteur Deepgram)
-  - `AssemblyAI API Key` (si moteur AssemblyAI)
-  - `OpenAI API Key` (traduction live optionnelle)
-  - `Perplexity API Key` (résumé optionnel)
-  - `HuggingFace Token` (si diarization voix avancée en post-process)
-- TRANSCRIPTION:
-  - choisir le moteur live
-  - choisir le mode d'identification de voix
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of the project structure.
 
-## Dossiers et sorties
+## Changelog
 
-Les sessions sont écrites sous `recordings/`:
+See [CHANGELOG.md](CHANGELOG.md) for the full history of changes.
 
-- WAV participants + micro
-- fichiers de transcription
-- fichiers de progression et logs de traitement
-- DOCX final (si activé)
+## Contributing
 
-## Notes importantes
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
 
-- La séparation des voix en live reste une fonctionnalité intrinsèquement moins stable que le post-traitement complet.
-- Le mode recommandé pour des comptes rendus fiables: live lisible + identification voix en post-process.
-- Le post-traitement est volontairement séparé en sous-processus pour robustesse.
-- Les clés API ne sont pas mises en cache applicatif en clair:
-  - stockage OS sécurisé (`keyring` / keychain / credential manager)
-  - fallback Windows DPAPI chiffré uniquement si backend keyring indisponible
+## Known Limitations
 
-## Patch notes
+- Live speaker identification is inherently less stable than post-processing diarization
+- Cross-platform build is not supported (PyInstaller does not cross-compile); use the target OS or CI
+- macOS loopback capture requires a virtual audio driver (BlackHole or similar)
 
-Le détail des évolutions livrées est dans:
+## License
 
-- `PATCH_NOTES_FR.md`
-
-## Licence
-
-MIT
+[MIT](LICENSE)

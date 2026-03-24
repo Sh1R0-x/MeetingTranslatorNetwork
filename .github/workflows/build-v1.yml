@@ -21,12 +21,12 @@ jobs:
           pip install pyinstaller
       - name: Build exe
         run: |
-          python -m PyInstaller --noconfirm --clean --windowed --name MeetingTranslatorNetwork --paths src --add-data "src\ui\style.qss;ui" --add-data "assets;assets" src\main.py
+          python -m PyInstaller --noconfirm --clean --windowed --name MeetingTranslatorNetwork --workpath artifacts/windows/build --distpath artifacts/windows/dist --specpath artifacts/windows/spec --paths src --add-data "src\ui\style.qss;ui" --add-data "assets;assets" src\main.py
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: MeetingTranslatorNetwork-windows
-          path: dist/MeetingTranslatorNetwork/**
+          path: artifacts/windows/dist/MeetingTranslatorNetwork/**
 
   build-macos:
     runs-on: macos-13

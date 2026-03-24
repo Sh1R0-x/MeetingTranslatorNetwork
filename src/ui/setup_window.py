@@ -292,14 +292,16 @@ class SetupWindow(QDialog):
     def __init__(self, start_page: str | None = None):
         super().__init__()
 
-        self.setWindowTitle("MeetingTranslator - Configuration")
+        self.setWindowTitle("MeetingTranslatorNetwork - Configuration")
         self.setMinimumSize(980, 640)
 
         self.cfg = loadconfig()
 
         self.metermic = LevelMeterSoundDevice()
         self.meterparticipants = LevelMeterLoopback()
+        self.meterparticipants_input = LevelMeterSoundDevice()
         self.activetest = None
+        self._is_windows = sys.platform.startswith("win")
 
         self.timer = QTimer(self)
         self.timer.setInterval(100)
@@ -397,7 +399,7 @@ class SetupWindow(QDialog):
         rowp = QHBoxLayout()
         rowp.setSpacing(10)
         rowp.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        rowp.addWidget(QLabel("Sortie audio"))
+        rowp.addWidget(QLabel("Sortie audio" if self._is_windows else "Source participants"))
         self.cbparticipants = _fix_field(QComboBox())
         rowp.addWidget(self.cbparticipants)
         self.btntestparticipants = _make_button("Tester")
@@ -756,9 +758,14 @@ class SetupWindow(QDialog):
         self.cbparticipants.clear()
         self.cbmicro.clear()
 
-        outs = list_wasapi_output_devices()
-        for d in outs:
-            self.cbparticipants.addItem(f"{d['index']} | {d['name']}", int(d["index"]))
+        if self._is_windows:
+            outs = list_wasapi_output_devices()
+            for d in outs:
+                self.cbparticipants.addItem(f"{d['index']} | {d['name']}", int(d["index"]))
+        else:
+            # On macOS/Linux, participants source is an input device (e.g. BlackHole/Loopback).
+            for devid, label in list_input_devices_with_api():
+                self.cbparticipants.addItem(label, int(devid))
         if self.cbparticipants.count() == 0:
             self.cbparticipants.addItem("Non disponible sur cette plateforme", -1)
             self.cbparticipants.setEnabled(False)
@@ -786,7 +793,12 @@ class SetupWindow(QDialog):
         try:
             if which == "participants":
                 outid = int(self.cbparticipants.currentData())
-                self.meterparticipants.start_from_output(outid)
+                if outid < 0:
+                    raise RuntimeError("Source participants non configurée.")
+                if self._is_windows and pyaudio is not None:
+                    self.meterparticipants.start_from_output(outid)
+                else:
+                    self.meterparticipants_input.start(outid, channels=1)
                 self.activetest = "participants"
                 self.btntestparticipants.setText("Arrêter")
                 self.btntestmicro.setEnabled(False)
@@ -809,6 +821,7 @@ class SetupWindow(QDialog):
         self.timer.stop()
         self.metermic.stop()
         self.meterparticipants.stop()
+        self.meterparticipants_input.stop()
 
         self.activetest = None
         self.pbparticipants.setValue(0)
@@ -823,7 +836,10 @@ class SetupWindow(QDialog):
 
     def refreshmeter(self):
         if self.activetest == "participants":
-            p = self.meterparticipants.poll()
+            if self._is_windows and pyaudio is not None:
+                p = self.meterparticipants.poll()
+            else:
+                p = self.meterparticipants_input.poll()
             self.pbparticipants.setValue(int(p * 1000))
         elif self.activetest == "micro":
             p = self.metermic.poll()
